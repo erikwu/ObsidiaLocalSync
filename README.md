@@ -1,5 +1,8 @@
 # SyncTwin
 
+- English version: [README.en.md](./README.en.md)
+- 文档维护约定：`README.md`、`README.en.md`、`Docs/SyncTwin_Product_Design.md`、`Docs/SyncTwin_Product_Design.en.md` 后续保持中英文同步更新。
+
 `SyncTwin` 是一个 macOS 本地双机目录同步工具，面向两台都安装了同一版本应用的 MacBook。它使用苹果系统自带的 `MultipeerConnectivity` 做设备发现和加密传输，优先通过局域网、点对点 Wi-Fi 和蓝牙建立连接，不依赖互联网公网。
 
 ## 已实现的核心规则

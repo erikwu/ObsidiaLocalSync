@@ -4,6 +4,8 @@
 - 对应应用版本：`1.0.8`
 - 对应协议版本：`2`
 - 更新时间：`2026-06-10`
+- English version: [SyncTwin_Product_Design.en.md](./SyncTwin_Product_Design.en.md)
+- 文档维护约定：本设计文档与 README 后续保持中英文同步更新。
 
 ## 1. 文档目标
 
