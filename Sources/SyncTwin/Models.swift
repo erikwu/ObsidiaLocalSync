@@ -19,6 +19,20 @@ struct AppConfiguration: Codable {
     }
 }
 
+enum SyncTriggerLabel: String, Codable {
+    case manual = "手工同步"
+    case automatic = "自动同步"
+
+    var priority: Int {
+        switch self {
+        case .manual:
+            return 2
+        case .automatic:
+            return 1
+        }
+    }
+}
+
 struct DiscoveredPeer: Identifiable, Equatable {
     let id: String
     let displayName: String
@@ -138,6 +152,18 @@ struct HelloMessage: Codable {
     let protocolVersion: Int
 }
 
+struct SyncIntentMessage: Codable {
+    let requestID: UUID
+    let initiatorDeviceID: String
+    let trigger: SyncTriggerLabel
+}
+
+struct SyncIntentResponseMessage: Codable {
+    let requestID: UUID
+    let accepted: Bool
+    let message: String
+}
+
 struct SyncOfferMessage: Codable {
     let requestID: UUID
     let baselineDigest: String
@@ -199,6 +225,8 @@ struct SyncErrorMessage: Codable {
 
 enum TransportMessageKind: String, Codable {
     case hello
+    case syncIntent
+    case syncIntentResponse
     case syncOffer
     case syncManifest
     case fileRequest

@@ -1,9 +1,28 @@
 import AppKit
 import Foundation
 
-enum SyncTriggerLabel: String {
-    case manual = "手工同步"
-    case automatic = "自动同步"
+private enum ActiveSyncSession {
+    case awaitingPermission(requestID: UUID, trigger: SyncTriggerLabel, peerDeviceID: String)
+    case initiating(requestID: UUID, trigger: SyncTriggerLabel, peerDeviceID: String)
+    case responding(requestID: UUID, peerDeviceID: String)
+
+    var requestID: UUID {
+        switch self {
+        case let .awaitingPermission(requestID, _, _),
+             let .initiating(requestID, _, _),
+             let .responding(requestID, _):
+            return requestID
+        }
+    }
+
+    var peerDeviceID: String {
+        switch self {
+        case let .awaitingPermission(_, _, peerDeviceID),
+             let .initiating(_, _, peerDeviceID),
+             let .responding(_, peerDeviceID):
+            return peerDeviceID
+        }
+    }
 }
 
 enum SyncControllerError: LocalizedError {
@@ -12,6 +31,7 @@ enum SyncControllerError: LocalizedError {
     case noFolderConfigured
     case versionMismatch(String)
     case baselineMismatch
+    case syncRejected(String)
     case timeout(String)
     case localStateChanged(String)
     case peerChanged(String)
@@ -28,6 +48,8 @@ enum SyncControllerError: LocalizedError {
             return message
         case .baselineMismatch:
             return "两台电脑保存的同步基线不一致，已拒绝同步。请在两端确认目录一致后再重试。"
+        case let .syncRejected(message):
+            return message
         case let .timeout(stage):
             return "\(stage) 超时，请检查两台电脑是否都在线。"
         case let .localStateChanged(path):
@@ -55,7 +77,13 @@ final class SyncTwinController: NSObject, ObservableObject {
 
     private var transport: PeerTransport?
     private var autoSyncTask: Task<Void, Never>?
+    private var activeSession: ActiveSyncSession? {
+        didSet {
+            isSyncInProgress = activeSession != nil
+        }
+    }
 
+    private var intentWaiters: [UUID: CheckedContinuation<SyncIntentResponseMessage, Error>] = [:]
     private var manifestWaiters: [UUID: CheckedContinuation<SyncManifestMessage, Error>] = [:]
     private var fileWaiters: [UUID: CheckedContinuation<FileBundleMessage, Error>] = [:]
     private var applyWaiters: [UUID: CheckedContinuation<ApplyResultMessage, Error>] = [:]
@@ -103,6 +131,15 @@ final class SyncTwinController: NSObject, ObservableObject {
 
     var canSyncNow: Bool {
         connectedPeerName != nil && remoteHello != nil && versionGateMessage == nil && watchedFolderURL != nil && !isSyncInProgress
+    }
+
+    private struct SyncExecutionContext {
+        let requestID: UUID
+        let trigger: SyncTriggerLabel
+        let peerName: String
+        let peerHello: HelloMessage
+        let root: URL
+        let transport: PeerTransport
     }
 
     func pickFolder() {
@@ -239,55 +276,51 @@ final class SyncTwinController: NSObject, ObservableObject {
     }
 
     private func beginSync(trigger: SyncTriggerLabel) {
-        guard !isSyncInProgress else {
-            statusText = "已有同步任务正在进行中。"
-            return
-        }
-
-        Task {
-            await performSync(trigger: trigger)
+        do {
+            let context = try prepareSyncExecutionContext(trigger: trigger)
+            Task {
+                await performSync(using: context)
+            }
+        } catch {
+            statusText = error.localizedDescription
+            addLog(statusText)
         }
     }
 
-    private func performSync(trigger: SyncTriggerLabel) async {
-        guard let peerName = connectedPeerName, let peerHello = remoteHello else {
-            statusText = SyncControllerError.noConnectedPeer.localizedDescription
-            return
-        }
-        if let versionGateMessage {
-            statusText = versionGateMessage
-            addLog(versionGateMessage)
-            return
-        }
-        guard let root = watchedFolderURL else {
-            statusText = SyncControllerError.noFolderConfigured.localizedDescription
-            return
-        }
-        guard let transport else {
-            statusText = SyncControllerError.transportUnavailable.localizedDescription
-            return
-        }
-
-        isSyncInProgress = true
-        statusText = "\(trigger.rawValue)中..."
-        addLog("开始\(trigger.rawValue)，目标：\(peerName)。")
+    private func performSync(using context: SyncExecutionContext) async {
+        statusText = "\(context.trigger.rawValue)中..."
+        addLog("开始\(context.trigger.rawValue)，目标：\(context.peerName)。")
 
         defer {
-            isSyncInProgress = false
+            releaseActiveSessionIfMatches(context.requestID)
         }
 
         do {
-            let baseline = storage.loadBaseline(for: peerHello.deviceID)
-            let localManifest = try await scanManifest(root: root)
+            let intentResponse = try await requestSyncPermission(
+                requestID: context.requestID,
+                trigger: context.trigger,
+                peerName: context.peerName,
+                transport: context.transport
+            )
+            guard intentResponse.accepted else {
+                throw SyncControllerError.syncRejected(intentResponse.message)
+            }
+            promoteToInitiatingSession(
+                requestID: context.requestID,
+                trigger: context.trigger,
+                peerDeviceID: context.peerHello.deviceID
+            )
+
+            let baseline = storage.loadBaseline(for: context.peerHello.deviceID)
+            let localManifest = try await scanManifest(root: context.root)
             let baselineDigest = SyncStateDigest.digest(for: baseline)
-            let requestID = UUID()
 
             let manifestMessage = try await requestRemoteManifest(
-                requestID: requestID,
+                requestID: context.requestID,
                 baselineDigest: baselineDigest,
                 localManifest: localManifest,
-                peerName: peerName,
-                transport: transport
+                peerName: context.peerName,
+                transport: context.transport
             )
 
             guard manifestMessage.baselineDigest == baselineDigest else {
@@ -295,7 +328,7 @@ final class SyncTwinController: NSObject, ObservableObject {
             }
 
             let plan = planner.makePlan(
-                requestID: requestID,
+                requestID: context.requestID,
                 baseline: baseline,
                 initiator: localManifest.files,
                 responder: manifestMessage.manifest.files
@@ -303,31 +336,31 @@ final class SyncTwinController: NSObject, ObservableObject {
 
             let requestedRemoteFiles = uniqueRequestedFiles(from: plan)
             let remoteBundleMessage = try await requestFiles(
-                requestID: requestID,
+                requestID: context.requestID,
                 files: requestedRemoteFiles,
-                peerName: peerName,
-                transport: transport
+                peerName: context.peerName,
+                transport: context.transport
             )
             let remoteFilesByPath = Dictionary(uniqueKeysWithValues: remoteBundleMessage.files.map { ($0.path, $0) })
 
             let localAttachmentBuild = buildLocalAttachments(
                 for: plan.operations.filter { $0.target == .responder && $0.source == .initiator },
-                root: root
+                root: context.root
             )
 
             let remoteApplyTask = Task {
                 try await self.sendPlanAndAwaitResult(
-                    requestID: requestID,
+                    requestID: context.requestID,
                     plan: plan,
                     attachments: localAttachmentBuild.files,
-                    peerName: peerName,
-                    transport: transport
+                    peerName: context.peerName,
+                    transport: context.transport
                 )
             }
 
             let localFailures = try await applyOperations(
                 plan.operations.filter { $0.target == .initiator },
-                on: root,
+                on: context.root,
                 localRole: .initiator,
                 remoteFilesByPath: remoteFilesByPath
             )
@@ -342,18 +375,16 @@ final class SyncTwinController: NSObject, ObservableObject {
             )
 
             let commitChanges = plan.baselineChanges.filter { !failurePaths.contains($0.path) }
-            if !commitChanges.isEmpty {
-                var updatedBaseline = baseline
-                updateBaseline(&updatedBaseline, with: commitChanges)
-                try storage.saveBaseline(updatedBaseline, for: peerHello.deviceID)
-                try transport.sendPayload(
-                    CommitBaselineMessage(requestID: requestID, changes: commitChanges),
-                    kind: .commitBaseline,
-                    to: peerName
-                )
-            }
+            var updatedBaseline = baseline
+            updateBaseline(&updatedBaseline, with: commitChanges)
+            try storage.saveBaseline(updatedBaseline, for: context.peerHello.deviceID)
+            try context.transport.sendPayload(
+                CommitBaselineMessage(requestID: context.requestID, changes: commitChanges),
+                kind: .commitBaseline,
+                to: context.peerName
+            )
 
-            registerPendingConflicts(plan.conflicts, remoteFilesByPath: remoteFilesByPath, peerHello: peerHello)
+            registerPendingConflicts(plan.conflicts, remoteFilesByPath: remoteFilesByPath, peerHello: context.peerHello)
 
             if !plan.conflicts.isEmpty {
                 statusText = "安全变更已自动同步，另有 \(plan.conflicts.count) 个冲突等待人工判断。"
@@ -364,9 +395,100 @@ final class SyncTwinController: NSObject, ObservableObject {
             }
             addLog(statusText)
         } catch {
+            if ownsLocalSession(requestID: context.requestID) {
+                try? context.transport.sendPayload(
+                    SyncErrorMessage(requestID: context.requestID, message: error.localizedDescription),
+                    kind: .syncError,
+                    to: context.peerName
+                )
+            }
             statusText = error.localizedDescription
             addLog(statusText)
         }
+    }
+
+    private func prepareSyncExecutionContext(trigger: SyncTriggerLabel) throws -> SyncExecutionContext {
+        guard activeSession == nil else {
+            throw SyncControllerError.syncRejected("已有同步任务正在进行中。")
+        }
+        guard let peerName = connectedPeerName, let peerHello = remoteHello else {
+            throw SyncControllerError.noConnectedPeer
+        }
+        if let versionGateMessage {
+            throw SyncControllerError.versionMismatch(versionGateMessage)
+        }
+        guard let root = watchedFolderURL else {
+            throw SyncControllerError.noFolderConfigured
+        }
+        guard let transport else {
+            throw SyncControllerError.transportUnavailable
+        }
+
+        let requestID = UUID()
+        activeSession = .awaitingPermission(
+            requestID: requestID,
+            trigger: trigger,
+            peerDeviceID: peerHello.deviceID
+        )
+
+        return SyncExecutionContext(
+            requestID: requestID,
+            trigger: trigger,
+            peerName: peerName,
+            peerHello: peerHello,
+            root: root,
+            transport: transport
+        )
+    }
+
+    private func promoteToInitiatingSession(
+        requestID: UUID,
+        trigger: SyncTriggerLabel,
+        peerDeviceID: String
+    ) {
+        guard activeSession?.requestID == requestID else {
+            return
+        }
+        activeSession = .initiating(
+            requestID: requestID,
+            trigger: trigger,
+            peerDeviceID: peerDeviceID
+        )
+    }
+
+    private func releaseActiveSessionIfMatches(_ requestID: UUID) {
+        guard activeSession?.requestID == requestID else {
+            return
+        }
+        activeSession = nil
+    }
+
+    private func ownsLocalSession(requestID: UUID) -> Bool {
+        switch activeSession {
+        case let .awaitingPermission(activeRequestID, _, _),
+             let .initiating(activeRequestID, _, _):
+            return activeRequestID == requestID
+        default:
+            return false
+        }
+    }
+
+    private func isResponderSession(requestID: UUID) -> Bool {
+        if case let .responding(activeRequestID, _) = activeSession {
+            return activeRequestID == requestID
+        }
+        return false
+    }
+
+    private func shouldRemoteIntentWin(
+        localTrigger: SyncTriggerLabel,
+        remoteTrigger: SyncTriggerLabel,
+        remoteDeviceID: String
+    ) -> Bool {
+        if remoteTrigger.priority != localTrigger.priority {
+            return remoteTrigger.priority > localTrigger.priority
+        }
+        return remoteDeviceID < config.deviceID
     }
 
     private func performConflictResolution(_ pending: PendingConflict, choice: ConflictChoice) async {
@@ -696,6 +818,38 @@ final class SyncTwinController: NSObject, ObservableObject {
         }.value
     }
 
+    private func requestSyncPermission(
+        requestID: UUID,
+        trigger: SyncTriggerLabel,
+        peerName: String,
+        transport: PeerTransport
+    ) async throws -> SyncIntentResponseMessage {
+        do {
+            return try await withTimeout("同步会话握手") {
+                try await withCheckedThrowingContinuation { continuation in
+                    self.intentWaiters[requestID] = continuation
+                    do {
+                        try transport.sendPayload(
+                            SyncIntentMessage(
+                                requestID: requestID,
+                                initiatorDeviceID: self.config.deviceID,
+                                trigger: trigger
+                            ),
+                            kind: .syncIntent,
+                            to: peerName
+                        )
+                    } catch {
+                        self.intentWaiters.removeValue(forKey: requestID)
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        } catch {
+            intentWaiters.removeValue(forKey: requestID)
+            throw error
+        }
+    }
+
     private func requestRemoteManifest(
         requestID: UUID,
         baselineDigest: String,
@@ -893,6 +1047,9 @@ final class SyncTwinController: NSObject, ObservableObject {
         addLog(message)
 
         let disconnectError = NSError(domain: AppConstants.appName, code: 99, userInfo: [NSLocalizedDescriptionKey: message])
+        for waiter in intentWaiters.values {
+            waiter.resume(throwing: disconnectError)
+        }
         for waiter in manifestWaiters.values {
             waiter.resume(throwing: disconnectError)
         }
@@ -902,9 +1059,11 @@ final class SyncTwinController: NSObject, ObservableObject {
         for waiter in applyWaiters.values {
             waiter.resume(throwing: disconnectError)
         }
+        intentWaiters.removeAll()
         manifestWaiters.removeAll()
         fileWaiters.removeAll()
         applyWaiters.removeAll()
+        activeSession = nil
     }
 }
 
@@ -955,6 +1114,16 @@ extension SyncTwinController: PeerTransportDelegate {
                     statusText = "已完成版本校验，可以开始同步。"
                 }
                 addLog("收到 \(message.deviceName) 的握手信息。")
+
+            case .syncIntent:
+                let message = try SyncMessageCodec.decodePayload(SyncIntentMessage.self, from: envelope)
+                Task {
+                    await handleSyncIntent(message, from: peerDisplayName)
+                }
+
+            case .syncIntentResponse:
+                let message = try SyncMessageCodec.decodePayload(SyncIntentResponseMessage.self, from: envelope)
+                intentWaiters.removeValue(forKey: message.requestID)?.resume(returning: message)
 
             case .syncOffer:
                 let message = try SyncMessageCodec.decodePayload(SyncOfferMessage.self, from: envelope)
@@ -1013,6 +1182,94 @@ extension SyncTwinController: PeerTransportDelegate {
 }
 
 extension SyncTwinController {
+    private func handleSyncIntent(_ message: SyncIntentMessage, from peerName: String) async {
+        guard let transport else {
+            return
+        }
+
+        let response: SyncIntentResponseMessage
+
+        if watchedFolderURL == nil {
+            response = SyncIntentResponseMessage(
+                requestID: message.requestID,
+                accepted: false,
+                message: SyncControllerError.noFolderConfigured.localizedDescription
+            )
+        } else if remoteHello == nil {
+            response = SyncIntentResponseMessage(
+                requestID: message.requestID,
+                accepted: false,
+                message: "版本握手尚未完成，当前无法开始同步。"
+            )
+        } else if let versionGateMessage {
+            response = SyncIntentResponseMessage(
+                requestID: message.requestID,
+                accepted: false,
+                message: versionGateMessage
+            )
+        } else {
+            switch activeSession {
+            case .none:
+                activeSession = .responding(
+                    requestID: message.requestID,
+                    peerDeviceID: message.initiatorDeviceID
+                )
+                response = SyncIntentResponseMessage(
+                    requestID: message.requestID,
+                    accepted: true,
+                    message: "同步会话已授权。"
+                )
+
+            case let .awaitingPermission(localRequestID, localTrigger, _):
+                if shouldRemoteIntentWin(
+                    localTrigger: localTrigger,
+                    remoteTrigger: message.trigger,
+                    remoteDeviceID: message.initiatorDeviceID
+                ) {
+                    intentWaiters.removeValue(forKey: localRequestID)?.resume(
+                        returning: SyncIntentResponseMessage(
+                            requestID: localRequestID,
+                            accepted: false,
+                            message: "另一台电脑的同步请求已优先执行，本次请求已自动让路。"
+                        )
+                    )
+                    activeSession = .responding(
+                        requestID: message.requestID,
+                        peerDeviceID: message.initiatorDeviceID
+                    )
+                    response = SyncIntentResponseMessage(
+                        requestID: message.requestID,
+                        accepted: true,
+                        message: "同步会话已授权。"
+                    )
+                } else {
+                    response = SyncIntentResponseMessage(
+                        requestID: message.requestID,
+                        accepted: false,
+                        message: "本机当前同步请求优先级更高，请等待本次同步结束后再试。"
+                    )
+                }
+
+            case let .responding(activeRequestID, peerDeviceID)
+                where activeRequestID == message.requestID && peerDeviceID == message.initiatorDeviceID:
+                response = SyncIntentResponseMessage(
+                    requestID: message.requestID,
+                    accepted: true,
+                    message: "同步会话已授权。"
+                )
+
+            case .responding, .initiating:
+                response = SyncIntentResponseMessage(
+                    requestID: message.requestID,
+                    accepted: false,
+                    message: "另一台电脑当前已有同步任务正在进行中。"
+                )
+            }
+        }
+
+        try? transport.sendPayload(response, kind: .syncIntentResponse, to: peerName)
+    }
+
     private func handleSyncOffer(_ message: SyncOfferMessage, from peerName: String) async {
         guard let transport else {
             return
@@ -1036,6 +1293,17 @@ extension SyncTwinController {
         if let versionGateMessage {
             try? transport.sendPayload(
                 SyncErrorMessage(requestID: message.requestID, message: versionGateMessage),
+                kind: .syncError,
+                to: peerName
+            )
+            return
+        }
+        guard isResponderSession(requestID: message.requestID) else {
+            try? transport.sendPayload(
+                SyncErrorMessage(
+                    requestID: message.requestID,
+                    message: "未建立有效的同步会话，已拒绝此次同步请求。"
+                ),
                 kind: .syncError,
                 to: peerName
             )
@@ -1070,6 +1338,17 @@ extension SyncTwinController {
         guard let transport, let root = watchedFolderURL else {
             return
         }
+        guard isResponderSession(requestID: message.requestID) else {
+            try? transport.sendPayload(
+                SyncErrorMessage(
+                    requestID: message.requestID,
+                    message: "未建立有效的同步会话，已拒绝此次文件请求。"
+                ),
+                kind: .syncError,
+                to: peerName
+            )
+            return
+        }
 
         let scanner = DirectoryScanner()
         let response = await Task.detached(priority: .utility) {
@@ -1100,10 +1379,17 @@ extension SyncTwinController {
         guard let transport, let root = watchedFolderURL else {
             return
         }
-
-        isSyncInProgress = true
-        defer {
-            isSyncInProgress = false
+        guard isResponderSession(requestID: message.requestID) else {
+            try? transport.sendPayload(
+                ApplyResultMessage(
+                    requestID: message.requestID,
+                    failures: [ApplyFailure(path: "/", message: "未建立有效的同步会话，已拒绝应用此次同步计划。")],
+                    note: "同步计划被拒绝。"
+                ),
+                kind: .applyResult,
+                to: peerName
+            )
+            return
         }
 
         let filesByPath = Dictionary(uniqueKeysWithValues: message.attachments.map { ($0.path, $0) })
@@ -1235,6 +1521,9 @@ extension SyncTwinController {
         guard let remoteHello else {
             return
         }
+        defer {
+            releaseActiveSessionIfMatches(message.requestID)
+        }
         do {
             var baseline = storage.loadBaseline(for: remoteHello.deviceID)
             updateBaseline(&baseline, with: message.changes)
@@ -1249,18 +1538,27 @@ extension SyncTwinController {
     private func handleSyncError(_ message: SyncErrorMessage) {
         let error = NSError(domain: AppConstants.appName, code: 401, userInfo: [NSLocalizedDescriptionKey: message.message])
         if let requestID = message.requestID {
+            if let waiter = intentWaiters.removeValue(forKey: requestID) {
+                waiter.resume(throwing: error)
+                releaseActiveSessionIfMatches(requestID)
+                return
+            }
             if let waiter = manifestWaiters.removeValue(forKey: requestID) {
                 waiter.resume(throwing: error)
+                releaseActiveSessionIfMatches(requestID)
                 return
             }
             if let waiter = fileWaiters.removeValue(forKey: requestID) {
                 waiter.resume(throwing: error)
+                releaseActiveSessionIfMatches(requestID)
                 return
             }
             if let waiter = applyWaiters.removeValue(forKey: requestID) {
                 waiter.resume(throwing: error)
+                releaseActiveSessionIfMatches(requestID)
                 return
             }
+            releaseActiveSessionIfMatches(requestID)
         }
         statusText = message.message
         addLog(message.message)
