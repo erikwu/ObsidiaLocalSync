@@ -294,6 +294,9 @@ final class SyncTwinController: NSObject, ObservableObject {
     }
 
     func startManualSync() {
+        if promoteActiveSessionToManualIfNeeded() {
+            return
+        }
         beginSync(trigger: .manual)
     }
 
@@ -906,6 +909,49 @@ final class SyncTwinController: NSObject, ObservableObject {
         return activeSession.trigger
     }
 
+    @discardableResult
+    private func promoteActiveSessionToManualIfNeeded() -> Bool {
+        guard let activeSession, activeSession.trigger == .automatic else {
+            return false
+        }
+
+        switch activeSession {
+        case let .awaitingPermission(requestID, _, peerDeviceID):
+            self.activeSession = .awaitingPermission(
+                requestID: requestID,
+                trigger: .manual,
+                peerDeviceID: peerDeviceID
+            )
+        case let .initiating(requestID, _, peerDeviceID):
+            self.activeSession = .initiating(
+                requestID: requestID,
+                trigger: .manual,
+                peerDeviceID: peerDeviceID
+            )
+        case let .responding(requestID, _, peerDeviceID):
+            self.activeSession = .responding(
+                requestID: requestID,
+                trigger: .manual,
+                peerDeviceID: peerDeviceID
+            )
+        }
+
+        statusText = "\(SyncTriggerLabel.manual.rawValue)中..."
+        if let syncProgress {
+            self.syncProgress = SyncProgressSnapshot(
+                phase: syncProgress.phase,
+                detail: syncProgress.detail.replacingOccurrences(
+                    of: SyncTriggerLabel.automatic.rawValue,
+                    with: SyncTriggerLabel.manual.rawValue
+                ),
+                fractionCompleted: syncProgress.fractionCompleted,
+                estimatedCompletionDate: syncProgress.estimatedCompletionDate
+            )
+        }
+        addLog("已将当前同步会话提升为\(SyncTriggerLabel.manual.rawValue)。")
+        return true
+    }
+
     private func fileServiceProgressRange(for requestID: UUID) -> ClosedRange<Double> {
         if ownsLocalSession(requestID: requestID) {
             return 0.64...0.80
@@ -985,7 +1031,7 @@ final class SyncTwinController: NSObject, ObservableObject {
 
             switch winningSide {
             case .initiator:
-                if let winnerState = pending.conflict.initiatorState {
+                if let winnerState = pending.conflict.initiatorState, !winnerState.isDirectory {
                     winnerAttachment = try scanner.bundleFile(root: root, relativePath: pending.conflict.path, expectedState: winnerState)
                 } else {
                     winnerAttachment = nil
@@ -994,7 +1040,7 @@ final class SyncTwinController: NSObject, ObservableObject {
 
             case .responder:
                 winnerAttachment = nil
-                if let loserState = pending.conflict.initiatorState {
+                if let loserState = pending.conflict.initiatorState, !loserState.isDirectory {
                     loserAttachment = try scanner.bundleFile(root: root, relativePath: pending.conflict.path, expectedState: loserState)
                 } else {
                     loserAttachment = nil
@@ -1133,7 +1179,7 @@ final class SyncTwinController: NSObject, ObservableObject {
         )
 
         for conflict in plan.conflicts {
-            if let expected = conflict.responderState {
+            if let expected = conflict.responderState, !expected.isDirectory {
                 map[conflict.path] = RequestedFile(path: conflict.path, expectedState: expected)
             }
         }
@@ -1145,7 +1191,7 @@ final class SyncTwinController: NSObject, ObservableObject {
         var map: [String: RequestedFile] = [:]
 
         for operation in operations {
-            guard let expected = operation.resultingState else {
+            guard let expected = operation.resultingState, !expected.isDirectory else {
                 continue
             }
             map[operation.path] = RequestedFile(path: operation.path, expectedState: expected)
@@ -1186,20 +1232,49 @@ final class SyncTwinController: NSObject, ObservableObject {
     }
 
     private func chunkOperations(_ operations: [SyncOperation]) -> [[SyncOperation]] {
-        guard !operations.isEmpty else {
+        let orderedOperations = orderedOperationsForApplication(operations)
+        guard !orderedOperations.isEmpty else {
             return []
         }
 
         var batches: [[SyncOperation]] = []
         var index = 0
 
-        while index < operations.count {
-            let upperBound = min(index + AppConstants.maxOperationBatchCount, operations.count)
-            batches.append(Array(operations[index..<upperBound]))
+        while index < orderedOperations.count {
+            let upperBound = min(index + AppConstants.maxOperationBatchCount, orderedOperations.count)
+            batches.append(Array(orderedOperations[index..<upperBound]))
             index = upperBound
         }
 
         return batches
+    }
+
+    private func orderedOperationsForApplication(_ operations: [SyncOperation]) -> [SyncOperation] {
+        operations.sorted { lhs, rhs in
+            if lhs.isDeletion != rhs.isDeletion {
+                return lhs.isDeletion == false
+            }
+
+            let lhsDepth = lhs.path.split(separator: "/").count
+            let rhsDepth = rhs.path.split(separator: "/").count
+
+            if lhs.isDeletion {
+                if lhsDepth != rhsDepth {
+                    return lhsDepth > rhsDepth
+                }
+            } else {
+                let lhsDirectory = lhs.resultingState?.isDirectory ?? false
+                let rhsDirectory = rhs.resultingState?.isDirectory ?? false
+                if lhsDirectory != rhsDirectory {
+                    return lhsDirectory
+                }
+                if lhsDepth != rhsDepth {
+                    return lhsDepth < rhsDepth
+                }
+            }
+
+            return lhs.path < rhs.path
+        }
     }
 
     private func progressFraction(in range: ClosedRange<Double>, completed: Int, total: Int) -> Double {
@@ -1380,6 +1455,19 @@ final class SyncTwinController: NSObject, ObservableObject {
                     continue
                 }
 
+                if resultState.isDirectory {
+                    do {
+                        try scanner.writeDirectory(
+                            root: root,
+                            relativePath: operation.path,
+                            modifiedAt: resultState.modifiedAt
+                        )
+                    } catch {
+                        failures.append(ApplyFailure(path: operation.path, message: error.localizedDescription))
+                    }
+                    continue
+                }
+
                 let fileToWrite: BundledFile
                 if source == localRole {
                     do {
@@ -1423,7 +1511,13 @@ final class SyncTwinController: NSObject, ObservableObject {
             }
 
             if winningSide == .initiator {
-                if let backupPath, let remoteBundle {
+                if let backupPath, let responderState = conflict.responderState, responderState.isDirectory {
+                    do {
+                        try scanner.writeDirectory(root: root, relativePath: backupPath, modifiedAt: responderState.modifiedAt)
+                    } catch {
+                        failures.append(ApplyFailure(path: backupPath, message: error.localizedDescription))
+                    }
+                } else if let backupPath, let remoteBundle {
                     do {
                         try scanner.writeData(
                             remoteBundle.data,
@@ -1446,25 +1540,33 @@ final class SyncTwinController: NSObject, ObservableObject {
             } else {
                 if let backupPath, let localState = conflict.initiatorState {
                     do {
-                        let localFile = try scanner.bundleFile(root: root, relativePath: conflict.path, expectedState: localState)
-                        try scanner.writeData(localFile.data, to: root, relativePath: backupPath, modifiedAt: localFile.fingerprint.modifiedAt)
+                        if localState.isDirectory {
+                            try scanner.writeDirectory(root: root, relativePath: backupPath, modifiedAt: localState.modifiedAt)
+                        } else {
+                            let localFile = try scanner.bundleFile(root: root, relativePath: conflict.path, expectedState: localState)
+                            try scanner.writeData(localFile.data, to: root, relativePath: backupPath, modifiedAt: localFile.fingerprint.modifiedAt)
+                        }
                     } catch {
                         failures.append(ApplyFailure(path: backupPath, message: error.localizedDescription))
                     }
                 }
 
                 if let remoteState = conflict.responderState {
-                    guard let remoteBundle, equivalentState(remoteBundle.fingerprint, remoteState) else {
-                        failures.append(ApplyFailure(path: conflict.path, message: "对端预览内容已经过期。"))
-                        return failures
-                    }
                     do {
-                        try scanner.writeData(
-                            remoteBundle.data,
-                            to: root,
-                            relativePath: conflict.path,
-                            modifiedAt: remoteBundle.fingerprint.modifiedAt
-                        )
+                        if remoteState.isDirectory {
+                            try scanner.writeDirectory(root: root, relativePath: conflict.path, modifiedAt: remoteState.modifiedAt)
+                        } else {
+                            guard let remoteBundle, equivalentState(remoteBundle.fingerprint, remoteState) else {
+                                failures.append(ApplyFailure(path: conflict.path, message: "对端预览内容已经过期。"))
+                                return failures
+                            }
+                            try scanner.writeData(
+                                remoteBundle.data,
+                                to: root,
+                                relativePath: conflict.path,
+                                modifiedAt: remoteBundle.fingerprint.modifiedAt
+                            )
+                        }
                     } catch {
                         failures.append(ApplyFailure(path: conflict.path, message: error.localizedDescription))
                     }
@@ -1561,7 +1663,10 @@ final class SyncTwinController: NSObject, ObservableObject {
         }
 
         do {
-            return try await withTimeout("文件拉取") {
+            return try await withTimeout(
+                "文件拉取",
+                timeoutSeconds: timeoutSecondsForFileBatch(files)
+            ) {
                 try await withCheckedThrowingContinuation { continuation in
                     self.fileWaiters[requestID] = continuation
                     do {
@@ -1597,7 +1702,10 @@ final class SyncTwinController: NSObject, ObservableObject {
         transport: PeerTransport
     ) async throws -> ApplyResultMessage {
         do {
-            return try await withTimeout("远端应用同步计划") {
+            return try await withTimeout(
+                "远端应用同步计划",
+                timeoutSeconds: timeoutSecondsForRemoteApply(plan)
+            ) {
                 try await withCheckedThrowingContinuation { continuation in
                     self.applyWaiters[requestID] = continuation
                     do {
@@ -1624,7 +1732,7 @@ final class SyncTwinController: NSObject, ObservableObject {
         transport: PeerTransport
     ) async throws -> ApplyResultMessage {
         do {
-            return try await withTimeout("远端执行冲突决议") {
+            return try await withTimeout("远端执行冲突决议", timeoutSeconds: 60) {
                 try await withCheckedThrowingContinuation { continuation in
                     self.applyWaiters[message.requestID] = continuation
                     do {
@@ -1647,6 +1755,9 @@ final class SyncTwinController: NSObject, ObservableObject {
         transport: PeerTransport
     ) async throws -> BundledFile? {
         guard let responderState = pending.conflict.responderState else {
+            return nil
+        }
+        if responderState.isDirectory {
             return nil
         }
 
@@ -1793,6 +1904,37 @@ final class SyncTwinController: NSObject, ObservableObject {
             for: peerDeviceID,
             rootPath: root.path
         )
+    }
+
+    private func timeoutSecondsForFileBatch(_ files: [RequestedFile]) -> TimeInterval {
+        let totalBytes = files.reduce(Int64(0)) { partial, file in
+            partial + max(Int64(1), file.expectedState.size)
+        }
+        let baseSeconds = 20.0
+        let byteAllowance = Double(totalBytes) / Double(256 * 1_024)
+        let fileCountAllowance = Double(files.count) * 0.1
+        let timeout = baseSeconds + byteAllowance + fileCountAllowance
+        return min(180, max(30, timeout))
+    }
+
+    private func timeoutSecondsForRemoteApply(_ plan: SyncPlan) -> TimeInterval {
+        let responderOperations = plan.operations.filter { $0.target == .responder }
+        let filesToServe = requestedFiles(
+            for: responderOperations.filter { $0.source == .initiator }
+        )
+        let fileBatchCount = chunkRequestedFiles(filesToServe).count
+        let operationBatchCount = chunkOperations(responderOperations).count
+        let totalBytes = filesToServe.reduce(Int64(0)) { partial, file in
+            partial + max(Int64(1), file.expectedState.size)
+        }
+
+        let baseSeconds = 45.0
+        let batchAllowance = Double(fileBatchCount) * 10
+        let operationAllowance = Double(operationBatchCount) * 4
+        let byteAllowance = Double(totalBytes) / Double(512 * 1_024)
+        let pathAllowance = Double(responderOperations.count) * 0.02
+        let timeout = baseSeconds + batchAllowance + operationAllowance + byteAllowance + pathAllowance
+        return min(1_800, max(45, timeout))
     }
 
     private func estimatedCurrentFileCount(
@@ -1987,13 +2129,18 @@ final class SyncTwinController: NSObject, ObservableObject {
         releaseActiveSessionIfMatches(requestID)
     }
 
-    private func withTimeout<T>(_ stage: String, operation: @escaping () async throws -> T) async throws -> T {
-        try await withThrowingTaskGroup(of: T.self) { group in
+    private func withTimeout<T>(
+        _ stage: String,
+        timeoutSeconds: TimeInterval = 20,
+        operation: @escaping () async throws -> T
+    ) async throws -> T {
+        let normalizedTimeout = max(1, timeoutSeconds)
+        return try await withThrowingTaskGroup(of: T.self) { group in
             group.addTask {
                 try await operation()
             }
             group.addTask {
-                try await Task.sleep(nanoseconds: 20 * 1_000_000_000)
+                try await Task.sleep(nanoseconds: UInt64(normalizedTimeout * 1_000_000_000))
                 throw SyncControllerError.timeout(stage)
             }
 
@@ -2617,14 +2764,24 @@ extension SyncTwinController {
                 if message.winningSide == .initiator {
                     if let backupPath = message.backupPath, let responderState = message.conflict.responderState {
                         do {
-                            let localFile = try scanner.bundleFile(root: root, relativePath: message.conflict.path, expectedState: responderState)
-                            try scanner.writeData(localFile.data, to: root, relativePath: backupPath, modifiedAt: localFile.fingerprint.modifiedAt)
+                            if responderState.isDirectory {
+                                try scanner.writeDirectory(root: root, relativePath: backupPath, modifiedAt: responderState.modifiedAt)
+                            } else {
+                                let localFile = try scanner.bundleFile(root: root, relativePath: message.conflict.path, expectedState: responderState)
+                                try scanner.writeData(localFile.data, to: root, relativePath: backupPath, modifiedAt: localFile.fingerprint.modifiedAt)
+                            }
                         } catch {
                             failures.append(ApplyFailure(path: backupPath, message: error.localizedDescription))
                         }
                     }
 
-                    if let winnerAttachment = message.winnerAttachment {
+                    if let winnerState = message.conflict.initiatorState, winnerState.isDirectory {
+                        do {
+                            try scanner.writeDirectory(root: root, relativePath: message.conflict.path, modifiedAt: winnerState.modifiedAt)
+                        } catch {
+                            failures.append(ApplyFailure(path: message.conflict.path, message: error.localizedDescription))
+                        }
+                    } else if let winnerAttachment = message.winnerAttachment {
                         do {
                             try scanner.writeData(
                                 winnerAttachment.data,
@@ -2643,7 +2800,13 @@ extension SyncTwinController {
                         }
                     }
                 } else {
-                    if let backupPath = message.backupPath, let loserAttachment = message.loserAttachment {
+                    if let backupPath = message.backupPath, let initiatorState = message.conflict.initiatorState, initiatorState.isDirectory {
+                        do {
+                            try scanner.writeDirectory(root: root, relativePath: backupPath, modifiedAt: initiatorState.modifiedAt)
+                        } catch {
+                            failures.append(ApplyFailure(path: backupPath, message: error.localizedDescription))
+                        }
+                    } else if let backupPath = message.backupPath, let loserAttachment = message.loserAttachment {
                         do {
                             try scanner.writeData(
                                 loserAttachment.data,

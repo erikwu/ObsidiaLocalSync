@@ -38,7 +38,7 @@ struct DirectoryScanner {
         }
 
         let scannedAt = Date()
-        let scan = try enumerateFiles(
+        let scan = try enumerateEntries(
             at: root,
             root: root,
             cachedFiles: cachedFiles
@@ -96,7 +96,7 @@ struct DirectoryScanner {
             throw DirectoryScannerError.noFolderConfigured
         }
 
-        return try enumerateFiles(at: root, root: root, cachedFiles: [:]).files
+        return try enumerateEntries(at: root, root: root, cachedFiles: [:]).files
     }
 
     func currentState(root: URL, relativePath: String) throws -> FileFingerprint? {
@@ -104,10 +104,13 @@ struct DirectoryScanner {
         guard fileManager.fileExists(atPath: url.path) else {
             return nil
         }
-        return try fingerprint(for: url)
+        return try itemState(for: url)
     }
 
     func bundleFile(root: URL, relativePath: String, expectedState: FileFingerprint) throws -> BundledFile {
+        guard !expectedState.isDirectory else {
+            throw DirectoryScannerError.unexpectedFileMissing(relativePath)
+        }
         let url = absoluteURL(root: root, relativePath: relativePath)
         guard fileManager.fileExists(atPath: url.path) else {
             throw DirectoryScannerError.unexpectedFileMissing(relativePath)
@@ -132,6 +135,7 @@ struct DirectoryScanner {
         let targetURL = absoluteURL(root: root, relativePath: file.path)
         let parent = targetURL.deletingLastPathComponent()
         try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+        try replaceDirectoryIfNeeded(at: targetURL)
         try file.data.write(to: targetURL, options: .atomic)
         let date = file.fingerprint.modifiedAt
         try? fileManager.setAttributes([.modificationDate: date], ofItemAtPath: targetURL.path)
@@ -141,6 +145,7 @@ struct DirectoryScanner {
         let targetURL = absoluteURL(root: root, relativePath: relativePath)
         let parent = targetURL.deletingLastPathComponent()
         try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+        try replaceDirectoryIfNeeded(at: targetURL)
         try data.write(to: targetURL, options: .atomic)
         if let modifiedAt {
             try? fileManager.setAttributes([.modificationDate: modifiedAt], ofItemAtPath: targetURL.path)
@@ -311,13 +316,13 @@ struct DirectoryScanner {
             return 1
         }
 
-        let subtreeScan = try enumerateFiles(at: url, root: root, cachedFiles: cachedSnapshot)
+        let subtreeScan = try enumerateEntries(at: url, root: root, cachedFiles: cachedSnapshot)
         removeEntries(in: &files, matching: relativePath)
         files.merge(subtreeScan.files) { _, new in new }
         return max(1, subtreeScan.workUnits)
     }
 
-    private func enumerateFiles(
+    private func enumerateEntries(
         at directoryURL: URL,
         root: URL,
         cachedFiles: [String: FileFingerprint]
@@ -330,6 +335,9 @@ struct DirectoryScanner {
             if rootValues.isSymbolicLink == true || rootValues.isDirectory != true {
                 return (files, 1)
             }
+            let directoryPath = relativePath(for: directoryURL, under: root)
+            files[directoryPath] = directoryFingerprint(for: rootValues)
+            workUnits += 1
         }
 
         guard let enumerator = fileManager.enumerator(
@@ -343,6 +351,12 @@ struct DirectoryScanner {
         for case let url as URL in enumerator {
             let values = try url.resourceValues(forKeys: resourceKeys)
             if values.isSymbolicLink == true {
+                continue
+            }
+            if values.isDirectory == true {
+                workUnits += 1
+                let directoryPath = relativePath(for: url, under: root)
+                files[directoryPath] = directoryFingerprint(for: values)
                 continue
             }
             guard values.isRegularFile == true else {
@@ -400,6 +414,16 @@ struct DirectoryScanner {
         return String(filePath.dropFirst(offset))
     }
 
+    private func itemState(for url: URL) throws -> FileFingerprint {
+        let resourceValues = try url.resourceValues(forKeys: [.isDirectoryKey, .contentModificationDateKey, .fileSizeKey])
+        if resourceValues.isDirectory == true {
+            return directoryFingerprint(for: resourceValues)
+        }
+        let modifiedAt = resourceValues.contentModificationDate ?? Date.distantPast
+        let size = Int64(resourceValues.fileSize ?? 0)
+        return try fingerprint(for: url, modifiedAt: modifiedAt, size: size)
+    }
+
     private func fingerprint(for url: URL) throws -> FileFingerprint {
         let resourceValues = try url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
         let modifiedAt = resourceValues.contentModificationDate ?? Date.distantPast
@@ -422,6 +446,40 @@ struct DirectoryScanner {
         }
 
         let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
-        return FileFingerprint(contentHash: digest, size: size, modifiedAt: modifiedAt)
+        return FileFingerprint(contentHash: digest, size: size, modifiedAt: modifiedAt, isDirectory: false)
+    }
+
+    func writeDirectory(root: URL, relativePath: String, modifiedAt: Date? = nil) throws {
+        let targetURL = absoluteURL(root: root, relativePath: relativePath)
+        try replaceFileIfNeeded(at: targetURL)
+        try fileManager.createDirectory(at: targetURL, withIntermediateDirectories: true)
+        if let modifiedAt {
+            try? fileManager.setAttributes([.modificationDate: modifiedAt], ofItemAtPath: targetURL.path)
+        }
+    }
+
+    private func replaceDirectoryIfNeeded(at url: URL) throws {
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return
+        }
+        try fileManager.removeItem(at: url)
+    }
+
+    private func replaceFileIfNeeded(at url: URL) throws {
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            return
+        }
+        try fileManager.removeItem(at: url)
+    }
+
+    private func directoryFingerprint(for values: URLResourceValues) -> FileFingerprint {
+        FileFingerprint(
+            contentHash: "__directory__",
+            size: 0,
+            modifiedAt: values.contentModificationDate ?? Date.distantPast,
+            isDirectory: true
+        )
     }
 }

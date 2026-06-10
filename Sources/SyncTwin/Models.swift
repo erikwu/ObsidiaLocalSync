@@ -67,7 +67,7 @@ struct AppConfiguration: Codable {
 }
 
 enum SyncTriggerLabel: String, Codable {
-    case manual = "手工同步"
+    case manual = "手动同步"
     case automatic = "自动同步"
 
     var priority: Int {
@@ -110,8 +110,47 @@ struct FileFingerprint: Codable, Hashable {
     let contentHash: String
     let size: Int64
     let modifiedAt: Date
+    let isDirectory: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case contentHash
+        case size
+        case modifiedAt
+        case isDirectory
+    }
+
+    init(
+        contentHash: String,
+        size: Int64,
+        modifiedAt: Date,
+        isDirectory: Bool = false
+    ) {
+        self.contentHash = contentHash
+        self.size = size
+        self.modifiedAt = modifiedAt
+        self.isDirectory = isDirectory
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        contentHash = try container.decode(String.self, forKey: .contentHash)
+        size = try container.decode(Int64.self, forKey: .size)
+        modifiedAt = try container.decode(Date.self, forKey: .modifiedAt)
+        isDirectory = try container.decodeIfPresent(Bool.self, forKey: .isDirectory) ?? false
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(contentHash, forKey: .contentHash)
+        try container.encode(size, forKey: .size)
+        try container.encode(modifiedAt, forKey: .modifiedAt)
+        try container.encode(isDirectory, forKey: .isDirectory)
+    }
 
     var shortSummary: String {
+        if isDirectory {
+            return "文件夹"
+        }
         let formatter = ByteCountFormatter()
         formatter.allowedUnits = [.useKB, .useMB, .useGB]
         formatter.countStyle = .file
@@ -480,7 +519,7 @@ enum SyncStateDigest {
         let canonical = files
             .sorted { $0.key < $1.key }
             .map { path, fingerprint in
-                "\(path)\t\(fingerprint.contentHash)\t\(fingerprint.size)"
+                "\(path)\t\(fingerprint.isDirectory ? "dir" : "file")\t\(fingerprint.contentHash)\t\(fingerprint.size)"
             }
             .joined(separator: "\n")
         let hash = SHA256.hash(data: Data(canonical.utf8))
@@ -522,6 +561,12 @@ func equivalentState(_ lhs: FileFingerprint?, _ rhs: FileFingerprint?) -> Bool {
     case (.none, .none):
         return true
     case let (.some(left), .some(right)):
+        guard left.isDirectory == right.isDirectory else {
+            return false
+        }
+        if left.isDirectory {
+            return true
+        }
         return left.contentHash == right.contentHash && left.size == right.size
     default:
         return false

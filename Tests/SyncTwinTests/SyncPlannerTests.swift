@@ -70,11 +70,49 @@ final class SyncPlannerTests: XCTestCase {
         XCTAssertEqual(plan.conflicts.first?.reason, .modifyVsDelete)
     }
 
+    func testSingleSidedDirectoryCreationCopiesToOtherSide() {
+        let createdDirectory = directoryFingerprint()
+
+        let plan = planner.makePlan(
+            requestID: UUID(),
+            baseline: [:],
+            initiatorDelta: delta(changed: ["folder/subfolder": createdDirectory]),
+            responderDelta: delta()
+        )
+
+        XCTAssertEqual(plan.operations.count, 1)
+        XCTAssertEqual(plan.operations.first?.target, .responder)
+        XCTAssertEqual(plan.operations.first?.resultingState, createdDirectory)
+        XCTAssertTrue(plan.conflicts.isEmpty)
+    }
+
+    func testDirectoryAndFileWithSamePathConflict() {
+        let plan = planner.makePlan(
+            requestID: UUID(),
+            baseline: [:],
+            initiatorDelta: delta(changed: ["workspace": directoryFingerprint()]),
+            responderDelta: delta(changed: ["workspace": fingerprint(hash: "file")])
+        )
+
+        XCTAssertTrue(plan.operations.isEmpty)
+        XCTAssertEqual(plan.conflicts.count, 1)
+        XCTAssertEqual(plan.conflicts.first?.reason, .bothCreatedDifferently)
+    }
+
     private func fingerprint(hash: String) -> FileFingerprint {
         FileFingerprint(
             contentHash: hash,
             size: Int64(hash.count),
             modifiedAt: Date(timeIntervalSince1970: 1_717_171_717)
+        )
+    }
+
+    private func directoryFingerprint() -> FileFingerprint {
+        FileFingerprint(
+            contentHash: "__directory__",
+            size: 0,
+            modifiedAt: Date(timeIntervalSince1970: 1_717_171_717),
+            isDirectory: true
         )
     }
 
