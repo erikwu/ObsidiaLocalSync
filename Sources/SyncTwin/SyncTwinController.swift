@@ -394,6 +394,7 @@ final class SyncTwinController: NSObject, ObservableObject {
                 statusText = "同步完成，没有发生内容丢失。"
             }
             addLog(statusText)
+            playCompletionSound()
         } catch {
             if ownsLocalSession(requestID: context.requestID) {
                 try? context.transport.sendPayload(
@@ -594,6 +595,7 @@ final class SyncTwinController: NSObject, ObservableObject {
             if !failurePaths.isEmpty {
                 statusText = "冲突处理部分完成，建议重新同步确认最新状态。"
                 addLog(statusText)
+                playCompletionSound()
                 return
             }
 
@@ -610,6 +612,7 @@ final class SyncTwinController: NSObject, ObservableObject {
             pendingConflicts.removeAll { $0.id == pending.id }
             statusText = "冲突已处理，未选中的版本已保留为冲突副本。"
             addLog(statusText)
+            playCompletionSound()
         } catch {
             statusText = error.localizedDescription
             addLog(statusText)
@@ -1017,6 +1020,14 @@ final class SyncTwinController: NSObject, ObservableObject {
         }.value
     }
 
+    private func playCompletionSound() {
+        if let sound = NSSound(named: NSSound.Name("Glass")) {
+            sound.play()
+        } else {
+            NSSound.beep()
+        }
+    }
+
     private func withTimeout<T>(_ stage: String, operation: @escaping () async throws -> T) async throws -> T {
         try await withThrowingTaskGroup(of: T.self) { group in
             group.addTask {
@@ -1416,6 +1427,7 @@ extension SyncTwinController {
                 statusText = "应用来自 \(peerName) 的同步计划时发生 \(failures.count) 处失败。"
             }
             addLog(statusText)
+            playCompletionSound()
         } catch {
             try? transport.sendPayload(
                 ApplyResultMessage(
