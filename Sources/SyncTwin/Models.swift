@@ -245,6 +245,10 @@ struct RequestedFile: Codable {
 struct FileRequestMessage: Codable {
     let requestID: UUID
     let files: [RequestedFile]
+    let batchIndex: Int
+    let totalBatches: Int
+    let totalRequestedFiles: Int
+    let completedFileCount: Int
 }
 
 struct FileBundleMessage: Codable {

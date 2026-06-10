@@ -369,56 +369,59 @@ final class SyncTwinController: NSObject, ObservableObject {
             let requestedRemoteFiles = uniqueRequestedFiles(from: plan)
             updateSyncProgress(
                 0.48,
-                phase: "正在收集对端文件",
+                phase: "正在接收对端文件",
                 detail: requestedRemoteFiles.isEmpty
                     ? "本次没有需要从 \(context.peerName) 拉取的文件。"
-                    : "正在从 \(context.peerName) 获取 \(requestedRemoteFiles.count) 个文件。"
+                    : "准备从 \(context.peerName) 获取 \(requestedRemoteFiles.count) 个文件。"
             )
-            let remoteBundleMessage = try await requestFiles(
+            let remoteBundleMessage = try await requestFilesInBatches(
                 requestID: context.requestID,
                 files: requestedRemoteFiles,
                 peerName: context.peerName,
-                transport: context.transport
-            )
+                transport: context.transport,
+                progressRange: 0.48...0.62,
+                phase: "正在接收对端文件"
+            ) { completed, total, batchIndex, totalBatches in
+                guard total > 0 else {
+                    return "本次没有需要接收的文件。"
+                }
+                return "已接收 \(completed)/\(total) 个文件（第 \(batchIndex)/\(totalBatches) 批）。"
+            }
             let remoteFilesByPath = Dictionary(uniqueKeysWithValues: remoteBundleMessage.files.map { ($0.path, $0) })
 
             let localOperations = plan.operations.filter { $0.target == .initiator }
             let remoteOperations = plan.operations.filter { $0.target == .responder }
-            let localAttachmentBuild = buildLocalAttachments(
-                for: remoteOperations.filter { $0.source == .initiator },
-                root: context.root
-            )
             updateSyncProgress(
                 0.62,
                 phase: "正在准备应用变更",
                 detail: remoteOperations.isEmpty
-                    ? "本次不需要向 \(context.peerName) 发送文件。"
-                    : "将向 \(context.peerName) 发送 \(localAttachmentBuild.files.count) 个文件，并应用 \(remoteOperations.count) 项变更。"
+                    ? "本次不需要让 \(context.peerName) 应用来自本机的变更。"
+                    : "正在通知 \(context.peerName) 拉取并应用 \(remoteOperations.count) 项变更。"
             )
 
             let remoteApplyTask = Task {
                 try await self.sendPlanAndAwaitResult(
                     requestID: context.requestID,
                     plan: plan,
-                    attachments: localAttachmentBuild.files,
+                    attachments: [],
                     peerName: context.peerName,
                     transport: context.transport
                 )
             }
 
-            updateSyncProgress(
-                localOperations.isEmpty ? 0.74 : 0.68,
-                phase: "正在更新本机文件",
-                detail: localOperations.isEmpty
-                    ? "本机没有需要写入的变更，正在等待对端处理。"
-                    : "本机正在处理 \(localOperations.count) 项变更。"
-            )
-            let localFailures = try await applyOperations(
+            let localFailures = try await applyOperationsInBatches(
                 localOperations,
                 on: context.root,
                 localRole: .initiator,
-                remoteFilesByPath: remoteFilesByPath
-            )
+                remoteFilesByPath: remoteFilesByPath,
+                progressRange: 0.68...0.82,
+                phase: "正在更新本机文件"
+            ) { completed, total, batchIndex, totalBatches in
+                guard total > 0 else {
+                    return "本机没有需要写入的变更，正在等待对端处理。"
+                }
+                return "已处理 \(completed)/\(total) 项本机变更（第 \(batchIndex)/\(totalBatches) 批）。"
+            }
 
             updateSyncProgress(
                 0.82,
@@ -431,7 +434,6 @@ final class SyncTwinController: NSObject, ObservableObject {
 
             let failurePaths = Set(
                 remoteBundleMessage.failures.map(\.path)
-                    + localAttachmentBuild.failures.map(\.path)
                     + localFailures.map(\.path)
                     + remoteApplyResult.failures.map(\.path)
             )
@@ -555,6 +557,13 @@ final class SyncTwinController: NSObject, ObservableObject {
             return nil
         }
         return activeSession.trigger
+    }
+
+    private func fileServiceProgressRange(for requestID: UUID) -> ClosedRange<Double> {
+        if ownsLocalSession(requestID: requestID) {
+            return 0.64...0.80
+        }
+        return 0.46...0.60
     }
 
     private func shouldRemoteIntentWin(
@@ -756,13 +765,11 @@ final class SyncTwinController: NSObject, ObservableObject {
     }
 
     private func uniqueRequestedFiles(from plan: SyncPlan) -> [RequestedFile] {
-        var map: [String: RequestedFile] = [:]
-
-        for operation in plan.operations where operation.target == .initiator && operation.source == .responder {
-            if let expected = operation.resultingState {
-                map[operation.path] = RequestedFile(path: operation.path, expectedState: expected)
-            }
-        }
+        var map = Dictionary(
+            uniqueKeysWithValues: requestedFiles(
+                for: plan.operations.filter { $0.target == .initiator && $0.source == .responder }
+            ).map { ($0.path, $0) }
+        )
 
         for conflict in plan.conflicts {
             if let expected = conflict.responderState {
@@ -773,23 +780,176 @@ final class SyncTwinController: NSObject, ObservableObject {
         return map.keys.sorted().compactMap { map[$0] }
     }
 
-    private func buildLocalAttachments(for operations: [SyncOperation], root: URL) -> (files: [BundledFile], failures: [ApplyFailure]) {
-        var files: [BundledFile] = []
-        var failures: [ApplyFailure] = []
+    private func requestedFiles(for operations: [SyncOperation]) -> [RequestedFile] {
+        var map: [String: RequestedFile] = [:]
 
         for operation in operations {
             guard let expected = operation.resultingState else {
                 continue
             }
-            do {
-                let file = try scanner.bundleFile(root: root, relativePath: operation.path, expectedState: expected)
-                files.append(file)
-            } catch {
-                failures.append(ApplyFailure(path: operation.path, message: error.localizedDescription))
-            }
+            map[operation.path] = RequestedFile(path: operation.path, expectedState: expected)
         }
 
-        return (files, failures)
+        return map.keys.sorted().compactMap { map[$0] }
+    }
+
+    private func chunkRequestedFiles(_ files: [RequestedFile]) -> [[RequestedFile]] {
+        guard !files.isEmpty else {
+            return []
+        }
+
+        var batches: [[RequestedFile]] = []
+        var currentBatch: [RequestedFile] = []
+        var currentBytes: Int64 = 0
+
+        for file in files {
+            let fileBytes = max(1, file.expectedState.size)
+            let wouldExceedCount = currentBatch.count >= AppConstants.maxTransferBatchFiles
+            let wouldExceedBytes = currentBytes + fileBytes > Int64(AppConstants.maxTransferBatchBytes)
+
+            if !currentBatch.isEmpty && (wouldExceedCount || wouldExceedBytes) {
+                batches.append(currentBatch)
+                currentBatch = []
+                currentBytes = 0
+            }
+
+            currentBatch.append(file)
+            currentBytes += fileBytes
+        }
+
+        if !currentBatch.isEmpty {
+            batches.append(currentBatch)
+        }
+
+        return batches
+    }
+
+    private func chunkOperations(_ operations: [SyncOperation]) -> [[SyncOperation]] {
+        guard !operations.isEmpty else {
+            return []
+        }
+
+        var batches: [[SyncOperation]] = []
+        var index = 0
+
+        while index < operations.count {
+            let upperBound = min(index + AppConstants.maxOperationBatchCount, operations.count)
+            batches.append(Array(operations[index..<upperBound]))
+            index = upperBound
+        }
+
+        return batches
+    }
+
+    private func progressFraction(in range: ClosedRange<Double>, completed: Int, total: Int) -> Double {
+        guard total > 0 else {
+            return range.upperBound
+        }
+
+        let normalized = min(max(Double(completed) / Double(total), 0), 1)
+        return range.lowerBound + (range.upperBound - range.lowerBound) * normalized
+    }
+
+    private func requestFilesInBatches(
+        requestID: UUID,
+        files: [RequestedFile],
+        peerName: String,
+        transport: PeerTransport,
+        progressRange: ClosedRange<Double>,
+        phase: String,
+        detailBuilder: (_ completed: Int, _ total: Int, _ batchIndex: Int, _ totalBatches: Int) -> String
+    ) async throws -> FileBundleMessage {
+        guard !files.isEmpty else {
+            return FileBundleMessage(requestID: requestID, files: [], failures: [])
+        }
+
+        let batches = chunkRequestedFiles(files)
+        var aggregatedFiles: [BundledFile] = []
+        var aggregatedFailures: [ApplyFailure] = []
+        var completedCount = 0
+
+        for (index, batch) in batches.enumerated() {
+            updateSyncProgress(
+                progressFraction(in: progressRange, completed: completedCount, total: files.count),
+                phase: phase,
+                detail: detailBuilder(completedCount, files.count, index + 1, batches.count)
+            )
+
+            let response = try await requestFilesBatch(
+                requestID: requestID,
+                files: batch,
+                batchIndex: index + 1,
+                totalBatches: batches.count,
+                totalRequestedFiles: files.count,
+                completedFileCount: completedCount,
+                peerName: peerName,
+                transport: transport
+            )
+
+            aggregatedFiles.append(contentsOf: response.files)
+            aggregatedFailures.append(contentsOf: response.failures)
+            completedCount += batch.count
+
+            updateSyncProgress(
+                progressFraction(in: progressRange, completed: completedCount, total: files.count),
+                phase: phase,
+                detail: detailBuilder(completedCount, files.count, index + 1, batches.count)
+            )
+        }
+
+        return FileBundleMessage(
+            requestID: requestID,
+            files: aggregatedFiles,
+            failures: aggregatedFailures
+        )
+    }
+
+    private func applyOperationsInBatches(
+        _ operations: [SyncOperation],
+        on root: URL,
+        localRole: PlanRole,
+        remoteFilesByPath: [String: BundledFile],
+        progressRange: ClosedRange<Double>,
+        phase: String,
+        detailBuilder: (_ completed: Int, _ total: Int, _ batchIndex: Int, _ totalBatches: Int) -> String
+    ) async throws -> [ApplyFailure] {
+        guard !operations.isEmpty else {
+            updateSyncProgress(
+                progressRange.upperBound,
+                phase: phase,
+                detail: detailBuilder(0, 0, 0, 0)
+            )
+            return []
+        }
+
+        let batches = chunkOperations(operations)
+        var aggregatedFailures: [ApplyFailure] = []
+        var completedCount = 0
+
+        for (index, batch) in batches.enumerated() {
+            updateSyncProgress(
+                progressFraction(in: progressRange, completed: completedCount, total: operations.count),
+                phase: phase,
+                detail: detailBuilder(completedCount, operations.count, index + 1, batches.count)
+            )
+
+            let failures = try await applyOperations(
+                batch,
+                on: root,
+                localRole: localRole,
+                remoteFilesByPath: remoteFilesByPath
+            )
+            aggregatedFailures.append(contentsOf: failures)
+            completedCount += batch.count
+
+            updateSyncProgress(
+                progressFraction(in: progressRange, completed: completedCount, total: operations.count),
+                phase: phase,
+                detail: detailBuilder(completedCount, operations.count, index + 1, batches.count)
+            )
+        }
+
+        return aggregatedFailures
     }
 
     private func applyOperations(
@@ -986,9 +1146,13 @@ final class SyncTwinController: NSObject, ObservableObject {
         }
     }
 
-    private func requestFiles(
+    private func requestFilesBatch(
         requestID: UUID,
         files: [RequestedFile],
+        batchIndex: Int,
+        totalBatches: Int,
+        totalRequestedFiles: Int,
+        completedFileCount: Int,
         peerName: String,
         transport: PeerTransport
     ) async throws -> FileBundleMessage {
@@ -1002,7 +1166,14 @@ final class SyncTwinController: NSObject, ObservableObject {
                     self.fileWaiters[requestID] = continuation
                     do {
                         try transport.sendPayload(
-                            FileRequestMessage(requestID: requestID, files: files),
+                            FileRequestMessage(
+                                requestID: requestID,
+                                files: files,
+                                batchIndex: batchIndex,
+                                totalBatches: totalBatches,
+                                totalRequestedFiles: totalRequestedFiles,
+                                completedFileCount: completedFileCount
+                            ),
                             kind: .fileRequest,
                             to: peerName
                         )
@@ -1083,9 +1254,13 @@ final class SyncTwinController: NSObject, ObservableObject {
             return BundledFile(path: pending.conflict.path, fingerprint: responderState, data: data)
         }
 
-        let bundleMessage = try await requestFiles(
+        let bundleMessage = try await requestFilesBatch(
             requestID: UUID(),
             files: [RequestedFile(path: pending.conflict.path, expectedState: responderState)],
+            batchIndex: 1,
+            totalBatches: 1,
+            totalRequestedFiles: 1,
+            completedFileCount: 0,
             peerName: peerName,
             transport: transport
         )
@@ -1547,10 +1722,14 @@ extension SyncTwinController {
             return
         }
 
+        let progressRange = fileServiceProgressRange(for: message.requestID)
+        let batchStartCount = min(message.completedFileCount, message.totalRequestedFiles)
         updateSyncProgress(
-            0.46,
+            progressFraction(in: progressRange, completed: batchStartCount, total: message.totalRequestedFiles),
             phase: "正在准备同步文件",
-            detail: "正在整理 \(message.files.count) 个文件发送给 \(peerName)。"
+            detail: message.totalRequestedFiles > 0
+                ? "已整理 \(batchStartCount)/\(message.totalRequestedFiles) 个文件，正在处理第 \(message.batchIndex)/\(message.totalBatches) 批并发送给 \(peerName)。"
+                : "正在整理文件发送给 \(peerName)。"
         )
         let scanner = DirectoryScanner()
         let response = await Task.detached(priority: .utility) {
@@ -1575,10 +1754,16 @@ extension SyncTwinController {
         }.value
 
         try? transport.sendPayload(response, kind: .fileBundle, to: peerName)
+        let batchCompletedCount = min(
+            message.completedFileCount + message.files.count,
+            message.totalRequestedFiles
+        )
         updateSyncProgress(
-            0.58,
+            progressFraction(in: progressRange, completed: batchCompletedCount, total: message.totalRequestedFiles),
             phase: "文件已发送",
-            detail: "已向 \(peerName) 发送 \(response.files.count) 个文件，等待对端应用同步计划。"
+            detail: message.totalRequestedFiles > 0
+                ? "已发送 \(batchCompletedCount)/\(message.totalRequestedFiles) 个文件给 \(peerName)。"
+                : "已向 \(peerName) 发送文件。"
         )
     }
 
@@ -1600,21 +1785,52 @@ extension SyncTwinController {
         }
 
         let responderOperations = message.plan.operations.filter { $0.target == .responder }
-        let filesByPath = Dictionary(uniqueKeysWithValues: message.attachments.map { ($0.path, $0) })
-        updateSyncProgress(
-            0.72,
-            phase: "正在应用对端变更",
-            detail: responderOperations.isEmpty
-                ? "本机没有需要写入的变更，正在确认结果。"
-                : "正在处理来自 \(peerName) 的 \(responderOperations.count) 项变更。"
-        )
+        var filesByPath = Dictionary(uniqueKeysWithValues: message.attachments.map { ($0.path, $0) })
         do {
-            let failures = try await applyOperations(
+            let filesToRequest = requestedFiles(
+                for: responderOperations.filter { $0.source == .initiator }
+            ).filter { filesByPath[$0.path] == nil }
+
+            var transferFailures: [ApplyFailure] = []
+            if !filesToRequest.isEmpty {
+                let bundle = try await requestFilesInBatches(
+                    requestID: message.requestID,
+                    files: filesToRequest,
+                    peerName: peerName,
+                    transport: transport,
+                    progressRange: 0.52...0.72,
+                    phase: "正在接收待应用文件"
+                ) { completed, total, batchIndex, totalBatches in
+                    "已接收 \(completed)/\(total) 个待应用文件（第 \(batchIndex)/\(totalBatches) 批）。"
+                }
+                transferFailures = bundle.failures
+                for file in bundle.files {
+                    filesByPath[file.path] = file
+                }
+            } else {
+                updateSyncProgress(
+                    0.72,
+                    phase: "待应用文件已就绪",
+                    detail: responderOperations.isEmpty
+                        ? "本机没有需要写入的变更，正在确认结果。"
+                        : "本轮变更不需要额外接收文件，准备开始写入。"
+                )
+            }
+
+            let applyFailures = try await applyOperationsInBatches(
                 responderOperations,
                 on: root,
                 localRole: .responder,
-                remoteFilesByPath: filesByPath
-            )
+                remoteFilesByPath: filesByPath,
+                progressRange: 0.72...0.88,
+                phase: "正在应用对端变更"
+            ) { completed, total, batchIndex, totalBatches in
+                guard total > 0 else {
+                    return "本机没有需要写入的变更，正在确认结果。"
+                }
+                return "已处理 \(completed)/\(total) 项对端变更（第 \(batchIndex)/\(totalBatches) 批）。"
+            }
+            let failures = transferFailures + applyFailures
 
             let result = ApplyResultMessage(
                 requestID: message.requestID,
