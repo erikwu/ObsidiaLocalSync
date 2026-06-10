@@ -88,6 +88,7 @@ final class SyncTwinController: NSObject, ObservableObject {
     private var transport: PeerTransport?
     private var autoSyncTask: Task<Void, Never>?
     private var progressResetTask: Task<Void, Never>?
+    private var progressStartedAt: Date?
     private var activeSession: ActiveSyncSession? {
         didSet {
             isSyncInProgress = activeSession != nil
@@ -98,6 +99,7 @@ final class SyncTwinController: NSObject, ObservableObject {
     private var manifestWaiters: [UUID: CheckedContinuation<SyncManifestMessage, Error>] = [:]
     private var fileWaiters: [UUID: CheckedContinuation<FileBundleMessage, Error>] = [:]
     private var applyWaiters: [UUID: CheckedContinuation<ApplyResultMessage, Error>] = [:]
+    private var pendingLocalManifests: [UUID: [String: FileFingerprint]] = [:]
 
     override init() {
         config = storage.loadConfiguration()
@@ -333,8 +335,13 @@ final class SyncTwinController: NSObject, ObservableObject {
                 detail: "正在读取本地目录状态，准备比较两边的改动。"
             )
 
-            let baseline = storage.loadBaseline(for: context.peerHello.deviceID)
-            let localManifest = try await scanManifest(root: context.root)
+            let baseline = storage.loadBaseline(for: context.peerHello.deviceID, rootPath: context.root.path)
+            let localScanResult = try await scanLocalState(
+                root: context.root,
+                baseline: baseline,
+                peerDeviceID: context.peerHello.deviceID
+            )
+            pendingLocalManifests[context.requestID] = localScanResult.manifest.files
             let baselineDigest = SyncStateDigest.digest(for: baseline)
             updateSyncProgress(
                 0.26,
@@ -345,7 +352,7 @@ final class SyncTwinController: NSObject, ObservableObject {
             let manifestMessage = try await requestRemoteManifest(
                 requestID: context.requestID,
                 baselineDigest: baselineDigest,
-                localManifest: localManifest,
+                localDelta: localScanResult.delta,
                 peerName: context.peerName,
                 transport: context.transport
             )
@@ -362,8 +369,8 @@ final class SyncTwinController: NSObject, ObservableObject {
             let plan = planner.makePlan(
                 requestID: context.requestID,
                 baseline: baseline,
-                initiator: localManifest.files,
-                responder: manifestMessage.manifest.files
+                initiatorDelta: localScanResult.delta,
+                responderDelta: manifestMessage.delta
             )
 
             let requestedRemoteFiles = uniqueRequestedFiles(from: plan)
@@ -423,6 +430,22 @@ final class SyncTwinController: NSObject, ObservableObject {
                 return "已处理 \(completed)/\(total) 项本机变更（第 \(batchIndex)/\(totalBatches) 批）。"
             }
 
+            if var localManifest = pendingLocalManifests[context.requestID] {
+                applyOperationsToManifest(
+                    &localManifest,
+                    operations: localOperations,
+                    excludingFailuresAt: Set(localFailures.map(\.path))
+                )
+                if !localFailures.isEmpty {
+                    try await refreshManifestEntries(
+                        &localManifest,
+                        root: context.root,
+                        relativePaths: Set(localFailures.map(\.path))
+                    )
+                }
+                pendingLocalManifests[context.requestID] = localManifest
+            }
+
             updateSyncProgress(
                 0.82,
                 phase: "等待对端完成",
@@ -446,7 +469,7 @@ final class SyncTwinController: NSObject, ObservableObject {
                 phase: "正在提交同步结果",
                 detail: "正在把最新同步基线写回两台电脑。"
             )
-            try storage.saveBaseline(updatedBaseline, for: context.peerHello.deviceID)
+            try storage.saveBaseline(updatedBaseline, for: context.peerHello.deviceID, rootPath: context.root.path)
             try context.transport.sendPayload(
                 CommitBaselineMessage(requestID: context.requestID, changes: commitChanges),
                 kind: .commitBaseline,
@@ -464,6 +487,14 @@ final class SyncTwinController: NSObject, ObservableObject {
             }
             completeSyncProgress(phase: "同步完成", detail: statusText)
             addLog(statusText)
+            if let finalManifest = pendingLocalManifests[context.requestID] {
+                try storage.saveLocalFingerprintCache(
+                    finalManifest,
+                    for: context.peerHello.deviceID,
+                    rootPath: context.root.path
+                )
+            }
+            pendingLocalManifests.removeValue(forKey: context.requestID)
             playCompletionSoundIfNeeded(for: context.trigger)
         } catch {
             if ownsLocalSession(requestID: context.requestID) {
@@ -473,6 +504,7 @@ final class SyncTwinController: NSObject, ObservableObject {
                     to: context.peerName
                 )
             }
+            pendingLocalManifests.removeValue(forKey: context.requestID)
             clearSyncProgress()
             statusText = error.localizedDescription
             addLog(statusText)
@@ -564,6 +596,10 @@ final class SyncTwinController: NSObject, ObservableObject {
             return 0.64...0.80
         }
         return 0.46...0.60
+    }
+
+    private func hasActiveSyncSession(requestID: UUID) -> Bool {
+        activeSession?.requestID == requestID
     }
 
     private func shouldRemoteIntentWin(
@@ -705,7 +741,7 @@ final class SyncTwinController: NSObject, ObservableObject {
                 return
             }
 
-            let baseline = storage.loadBaseline(for: peerHello.deviceID)
+            let baseline = storage.loadBaseline(for: peerHello.deviceID, rootPath: root.path)
             var updatedBaseline = baseline
             updateBaseline(&updatedBaseline, with: baselineChanges)
             updateSyncProgress(
@@ -713,7 +749,7 @@ final class SyncTwinController: NSObject, ObservableObject {
                 phase: "正在提交冲突结果",
                 detail: "正在更新两台电脑的同步基线。"
             )
-            try storage.saveBaseline(updatedBaseline, for: peerHello.deviceID)
+            try storage.saveBaseline(updatedBaseline, for: peerHello.deviceID, rootPath: root.path)
             try transport.sendPayload(
                 CommitBaselineMessage(requestID: requestID, changes: baselineChanges),
                 kind: .commitBaseline,
@@ -1120,7 +1156,7 @@ final class SyncTwinController: NSObject, ObservableObject {
     private func requestRemoteManifest(
         requestID: UUID,
         baselineDigest: String,
-        localManifest: DirectoryManifest,
+        localDelta: DirectoryDeltaManifest,
         peerName: String,
         transport: PeerTransport
     ) async throws -> SyncManifestMessage {
@@ -1130,7 +1166,11 @@ final class SyncTwinController: NSObject, ObservableObject {
                     self.manifestWaiters[requestID] = continuation
                     do {
                         try transport.sendPayload(
-                            SyncOfferMessage(requestID: requestID, baselineDigest: baselineDigest, manifest: localManifest),
+                            SyncOfferMessage(
+                                requestID: requestID,
+                                baselineDigest: baselineDigest,
+                                delta: localDelta
+                            ),
                             kind: .syncOffer,
                             to: peerName
                         )
@@ -1285,10 +1325,15 @@ final class SyncTwinController: NSObject, ObservableObject {
         throw SyncControllerError.peerChanged(pending.conflict.path)
     }
 
-    private func scanManifest(root: URL) async throws -> DirectoryManifest {
+    private func scanLocalState(
+        root: URL,
+        baseline: [String: FileFingerprint],
+        peerDeviceID: String
+    ) async throws -> LocalScanResult {
         let scanner = DirectoryScanner()
+        let cachedFiles = storage.loadLocalFingerprintCache(for: peerDeviceID, rootPath: root.path)
         return try await Task.detached(priority: .userInitiated) {
-            try scanner.scan(root: root)
+            try scanner.scan(root: root, cachedFiles: cachedFiles, baseline: baseline)
         }.value
     }
 
@@ -1297,6 +1342,43 @@ final class SyncTwinController: NSObject, ObservableObject {
         return try await Task.detached(priority: .userInitiated) {
             try scanner.currentState(root: root, relativePath: relativePath)
         }.value
+    }
+
+    private func refreshManifestEntries(
+        _ manifest: inout [String: FileFingerprint],
+        root: URL,
+        relativePaths: Set<String>
+    ) async throws {
+        let scanner = DirectoryScanner()
+        let refreshed = try await Task.detached(priority: .utility) {
+            var updatedStates: [String: FileFingerprint?] = [:]
+            for path in relativePaths.sorted() {
+                updatedStates[path] = try scanner.currentState(root: root, relativePath: path)
+            }
+            return updatedStates
+        }.value
+
+        for (path, state) in refreshed {
+            if let state {
+                manifest[path] = state
+            } else {
+                manifest.removeValue(forKey: path)
+            }
+        }
+    }
+
+    private func applyOperationsToManifest(
+        _ manifest: inout [String: FileFingerprint],
+        operations: [SyncOperation],
+        excludingFailuresAt failurePaths: Set<String>
+    ) {
+        for operation in operations where !failurePaths.contains(operation.path) {
+            if let resultingState = operation.resultingState {
+                manifest[operation.path] = resultingState
+            } else {
+                manifest.removeValue(forKey: operation.path)
+            }
+        }
     }
 
     private func playCompletionSound() {
@@ -1323,13 +1405,40 @@ final class SyncTwinController: NSObject, ObservableObject {
         }
     }
 
+    private func estimatedCompletionDate(for fraction: Double, now: Date) -> Date? {
+        guard let progressStartedAt else {
+            return nil
+        }
+        let clamped = min(max(fraction, 0), 1)
+        guard clamped >= 0.02, clamped < 0.995 else {
+            return nil
+        }
+
+        let elapsed = now.timeIntervalSince(progressStartedAt)
+        guard elapsed >= 1 else {
+            return nil
+        }
+
+        let remaining = elapsed * (1 - clamped) / clamped
+        guard remaining.isFinite, remaining > 0 else {
+            return nil
+        }
+
+        return now.addingTimeInterval(remaining)
+    }
+
     private func updateSyncProgress(_ fraction: Double, phase: String, detail: String) {
         progressResetTask?.cancel()
         progressResetTask = nil
+        let now = Date()
+        if progressStartedAt == nil || fraction + 0.1 < (syncProgress?.clampedFraction ?? 0) {
+            progressStartedAt = now
+        }
         syncProgress = SyncProgressSnapshot(
             phase: phase,
             detail: detail,
-            fractionCompleted: fraction
+            fractionCompleted: fraction,
+            estimatedCompletionDate: estimatedCompletionDate(for: fraction, now: now)
         )
     }
 
@@ -1338,7 +1447,8 @@ final class SyncTwinController: NSObject, ObservableObject {
         syncProgress = SyncProgressSnapshot(
             phase: phase,
             detail: detail,
-            fractionCompleted: 1
+            fractionCompleted: 1,
+            estimatedCompletionDate: nil
         )
         progressResetTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 1_800_000_000)
@@ -1355,6 +1465,7 @@ final class SyncTwinController: NSObject, ObservableObject {
     private func clearSyncProgress() {
         progressResetTask?.cancel()
         progressResetTask = nil
+        progressStartedAt = nil
         syncProgress = nil
     }
 
@@ -1362,6 +1473,7 @@ final class SyncTwinController: NSObject, ObservableObject {
         if activeSession?.requestID == requestID {
             clearSyncProgress()
         }
+        pendingLocalManifests.removeValue(forKey: requestID)
         releaseActiveSessionIfMatches(requestID)
     }
 
@@ -1392,6 +1504,7 @@ final class SyncTwinController: NSObject, ObservableObject {
         connectedPeerName = nil
         remoteHello = nil
         clearSyncProgress()
+        progressStartedAt = nil
         statusText = message
         addLog(message)
 
@@ -1412,6 +1525,7 @@ final class SyncTwinController: NSObject, ObservableObject {
         manifestWaiters.removeAll()
         fileWaiters.removeAll()
         applyWaiters.removeAll()
+        pendingLocalManifests.removeAll()
         activeSession = nil
     }
 }
@@ -1677,22 +1791,33 @@ extension SyncTwinController {
                 phase: "正在扫描本机目录",
                 detail: "正在为 \(peerName) 准备本地目录清单。"
             )
-            let localBaseline = storage.loadBaseline(for: remoteHello.deviceID)
+            let localBaseline = storage.loadBaseline(for: remoteHello.deviceID, rootPath: root.path)
             let localDigest = SyncStateDigest.digest(for: localBaseline)
             guard localDigest == message.baselineDigest else {
                 throw SyncControllerError.baselineMismatch
             }
 
-            let manifest = try await scanManifest(root: root)
+            let localScanResult = try await scanLocalState(
+                root: root,
+                baseline: localBaseline,
+                peerDeviceID: remoteHello.deviceID
+            )
+            pendingLocalManifests[message.requestID] = localScanResult.manifest.files
             try transport.sendPayload(
-                SyncManifestMessage(requestID: message.requestID, baselineDigest: localDigest, manifest: manifest),
+                SyncManifestMessage(
+                    requestID: message.requestID,
+                    baselineDigest: localDigest,
+                    delta: localScanResult.delta
+                ),
                 kind: .syncManifest,
                 to: peerName
             )
             updateSyncProgress(
                 0.32,
                 phase: "目录清单已发送",
-                detail: "已将本地目录摘要发给 \(peerName)，等待对端生成同步计划。"
+                detail: localScanResult.delta.changedPathCount == 0
+                    ? "本机自上次同步以来没有文件变更，等待 \(peerName) 生成同步计划。"
+                    : "已将 \(localScanResult.delta.changedPathCount) 个变更路径发给 \(peerName)，等待对端生成同步计划。"
             )
             statusText = "已向 \(peerName) 发送本地目录清单。"
             addLog(statusText)
@@ -1702,6 +1827,7 @@ extension SyncTwinController {
                 kind: .syncError,
                 to: peerName
             )
+            pendingLocalManifests.removeValue(forKey: message.requestID)
             resetSessionStateIfMatches(message.requestID)
         }
     }
@@ -1710,7 +1836,7 @@ extension SyncTwinController {
         guard let transport, let root = watchedFolderURL else {
             return
         }
-        guard isResponderSession(requestID: message.requestID) else {
+        guard hasActiveSyncSession(requestID: message.requestID) else {
             try? transport.sendPayload(
                 SyncErrorMessage(
                     requestID: message.requestID,
@@ -1831,6 +1957,22 @@ extension SyncTwinController {
                 return "已处理 \(completed)/\(total) 项对端变更（第 \(batchIndex)/\(totalBatches) 批）。"
             }
             let failures = transferFailures + applyFailures
+
+            if var localManifest = pendingLocalManifests[message.requestID] {
+                applyOperationsToManifest(
+                    &localManifest,
+                    operations: responderOperations,
+                    excludingFailuresAt: Set(failures.map(\.path))
+                )
+                if !failures.isEmpty {
+                    try await refreshManifestEntries(
+                        &localManifest,
+                        root: root,
+                        relativePaths: Set(failures.map(\.path))
+                    )
+                }
+                pendingLocalManifests[message.requestID] = localManifest
+            }
 
             let result = ApplyResultMessage(
                 requestID: message.requestID,
@@ -1972,15 +2114,24 @@ extension SyncTwinController {
         guard let remoteHello else {
             return
         }
+        let rootPath = watchedFolderURL?.path ?? config.watchedFolderPath
         let shouldCompleteResponderProgress = isResponderSession(requestID: message.requestID)
         defer {
             releaseActiveSessionIfMatches(message.requestID)
         }
         do {
-            var baseline = storage.loadBaseline(for: remoteHello.deviceID)
+            var baseline = storage.loadBaseline(for: remoteHello.deviceID, rootPath: rootPath)
             updateBaseline(&baseline, with: message.changes)
-            try storage.saveBaseline(baseline, for: remoteHello.deviceID)
+            try storage.saveBaseline(baseline, for: remoteHello.deviceID, rootPath: rootPath)
             addLog("已提交 \(message.changes.count) 条同步基线更新。")
+            if let root = watchedFolderURL, let manifest = pendingLocalManifests[message.requestID] {
+                try storage.saveLocalFingerprintCache(
+                    manifest,
+                    for: remoteHello.deviceID,
+                    rootPath: root.path
+                )
+            }
+            pendingLocalManifests.removeValue(forKey: message.requestID)
             if shouldCompleteResponderProgress {
                 completeSyncProgress(
                     phase: "同步完成",
@@ -1988,6 +2139,7 @@ extension SyncTwinController {
                 )
             }
         } catch {
+            pendingLocalManifests.removeValue(forKey: message.requestID)
             clearSyncProgress()
             statusText = "保存同步基线失败：\(error.localizedDescription)"
             addLog(statusText)

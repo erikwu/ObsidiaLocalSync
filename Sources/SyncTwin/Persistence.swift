@@ -7,6 +7,7 @@ final class AppStorage {
     private let baseURL: URL
     private let configURL: URL
     private let baselinesDirectoryURL: URL
+    private let localCachesDirectoryURL: URL
     private let previewDirectoryURL: URL
 
     private init() {
@@ -14,6 +15,7 @@ final class AppStorage {
         baseURL = applicationSupport.appendingPathComponent(AppConstants.appName, isDirectory: true)
         configURL = baseURL.appendingPathComponent("config.json")
         baselinesDirectoryURL = baseURL.appendingPathComponent("Baselines", isDirectory: true)
+        localCachesDirectoryURL = baseURL.appendingPathComponent("LocalFingerprints", isDirectory: true)
         previewDirectoryURL = baseURL.appendingPathComponent("ConflictPreviews", isDirectory: true)
         try? prepareDirectories()
     }
@@ -31,18 +33,36 @@ final class AppStorage {
         try data.write(to: configURL, options: .atomic)
     }
 
-    func loadBaseline(for peerDeviceID: String) -> [String: FileFingerprint] {
-        let url = baselineURL(for: peerDeviceID)
+    func loadBaseline(for peerDeviceID: String, rootPath: String) -> [String: FileFingerprint] {
+        let url = baselineURL(for: peerDeviceID, rootPath: rootPath)
         guard let data = try? Data(contentsOf: url) else {
             return [:]
         }
         return (try? SyncMessageCodec.decoder.decode([String: FileFingerprint].self, from: data)) ?? [:]
     }
 
-    func saveBaseline(_ baseline: [String: FileFingerprint], for peerDeviceID: String) throws {
+    func saveBaseline(_ baseline: [String: FileFingerprint], for peerDeviceID: String, rootPath: String) throws {
         try prepareDirectories()
         let data = try SyncMessageCodec.encoder.encode(baseline)
-        try data.write(to: baselineURL(for: peerDeviceID), options: .atomic)
+        try data.write(to: baselineURL(for: peerDeviceID, rootPath: rootPath), options: .atomic)
+    }
+
+    func loadLocalFingerprintCache(for peerDeviceID: String, rootPath: String) -> [String: FileFingerprint] {
+        let url = localFingerprintCacheURL(for: peerDeviceID, rootPath: rootPath)
+        guard let data = try? Data(contentsOf: url) else {
+            return [:]
+        }
+        return (try? SyncMessageCodec.decoder.decode([String: FileFingerprint].self, from: data)) ?? [:]
+    }
+
+    func saveLocalFingerprintCache(
+        _ fingerprints: [String: FileFingerprint],
+        for peerDeviceID: String,
+        rootPath: String
+    ) throws {
+        try prepareDirectories()
+        let data = try SyncMessageCodec.encoder.encode(fingerprints)
+        try data.write(to: localFingerprintCacheURL(for: peerDeviceID, rootPath: rootPath), options: .atomic)
     }
 
     func storeRemotePreview(data: Data, conflictID: UUID, originalPath: String) throws -> URL {
@@ -64,15 +84,24 @@ final class AppStorage {
         try? fileManager.createDirectory(at: previewDirectoryURL, withIntermediateDirectories: true)
     }
 
-    private func baselineURL(for peerDeviceID: String) -> URL {
-        baselinesDirectoryURL
-            .appendingPathComponent(sanitizedFilenameComponent(peerDeviceID))
+    private func baselineURL(for peerDeviceID: String, rootPath: String) -> URL {
+        let directoryKey = stableDigestString(rootPath)
+        return baselinesDirectoryURL
+            .appendingPathComponent("\(sanitizedFilenameComponent(peerDeviceID))-\(directoryKey)")
+            .appendingPathExtension("json")
+    }
+
+    private func localFingerprintCacheURL(for peerDeviceID: String, rootPath: String) -> URL {
+        let directoryKey = stableDigestString(rootPath)
+        return localCachesDirectoryURL
+            .appendingPathComponent("\(sanitizedFilenameComponent(peerDeviceID))-\(directoryKey)")
             .appendingPathExtension("json")
     }
 
     private func prepareDirectories() throws {
         try fileManager.createDirectory(at: baseURL, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: baselinesDirectoryURL, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: localCachesDirectoryURL, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: previewDirectoryURL, withIntermediateDirectories: true)
     }
 }

@@ -95,6 +95,7 @@ struct SyncProgressSnapshot: Equatable {
     let phase: String
     let detail: String
     let fractionCompleted: Double
+    let estimatedCompletionDate: Date?
 
     var clampedFraction: Double {
         min(max(fractionCompleted, 0), 1)
@@ -130,6 +131,32 @@ struct FileFingerprint: Codable, Hashable {
 struct DirectoryManifest: Codable {
     let scannedAt: Date
     let files: [String: FileFingerprint]
+}
+
+struct DirectoryDeltaManifest: Codable {
+    let scannedAt: Date
+    let changedFiles: [String: FileFingerprint]
+    let deletedPaths: [String]
+
+    var changedPathCount: Int {
+        changedFiles.count + deletedPaths.count
+    }
+
+    func hasChange(at path: String) -> Bool {
+        changedFiles[path] != nil || deletedPaths.contains(path)
+    }
+
+    func resolvedState(for path: String, baselineState: FileFingerprint?) -> FileFingerprint? {
+        if deletedPaths.contains(path) {
+            return nil
+        }
+        return changedFiles[path] ?? baselineState
+    }
+}
+
+struct LocalScanResult {
+    let manifest: DirectoryManifest
+    let delta: DirectoryDeltaManifest
 }
 
 struct BaselineChange: Codable, Hashable {
@@ -228,13 +255,13 @@ struct SyncIntentResponseMessage: Codable {
 struct SyncOfferMessage: Codable {
     let requestID: UUID
     let baselineDigest: String
-    let manifest: DirectoryManifest
+    let delta: DirectoryDeltaManifest
 }
 
 struct SyncManifestMessage: Codable {
     let requestID: UUID
     let baselineDigest: String
-    let manifest: DirectoryManifest
+    let delta: DirectoryDeltaManifest
 }
 
 struct RequestedFile: Codable {
@@ -376,6 +403,11 @@ func sanitizedFilenameComponent(_ raw: String) -> String {
     let parts = raw.components(separatedBy: invalid).filter { !$0.isEmpty }
     let candidate = parts.joined(separator: "_")
     return candidate.isEmpty ? "peer" : candidate
+}
+
+func stableDigestString(_ raw: String) -> String {
+    let digest = Insecure.MD5.hash(data: Data(raw.utf8))
+    return digest.map { String(format: "%02x", $0) }.joined()
 }
 
 func conflictBackupPath(originalPath: String, losingLabel: String, conflictID: UUID) -> String {

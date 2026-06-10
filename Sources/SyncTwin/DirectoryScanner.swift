@@ -21,7 +21,83 @@ enum DirectoryScannerError: LocalizedError {
 struct DirectoryScanner {
     private let fileManager = FileManager.default
 
-    func scan(root: URL) throws -> DirectoryManifest {
+    func scan(
+        root: URL,
+        cachedFiles: [String: FileFingerprint],
+        baseline: [String: FileFingerprint]
+    ) throws -> LocalScanResult {
+        guard fileManager.fileExists(atPath: root.path) else {
+            throw DirectoryScannerError.noFolderConfigured
+        }
+
+        let scannedAt = Date()
+        var files: [String: FileFingerprint] = [:]
+        var changedFiles: [String: FileFingerprint] = [:]
+        let resourceKeys: Set<URLResourceKey> = [
+            .isRegularFileKey,
+            .isSymbolicLinkKey,
+            .contentModificationDateKey,
+            .fileSizeKey,
+        ]
+
+        guard let enumerator = fileManager.enumerator(
+            at: root,
+            includingPropertiesForKeys: Array(resourceKeys),
+            options: []
+        ) else {
+            return LocalScanResult(
+                manifest: DirectoryManifest(scannedAt: scannedAt, files: files),
+                delta: DirectoryDeltaManifest(
+                    scannedAt: scannedAt,
+                    changedFiles: [:],
+                    deletedPaths: baseline.keys.sorted()
+                )
+            )
+        }
+
+        for case let url as URL in enumerator {
+            let values = try url.resourceValues(forKeys: resourceKeys)
+            if values.isSymbolicLink == true {
+                continue
+            }
+            guard values.isRegularFile == true else {
+                continue
+            }
+
+            let relativePath = relativePath(for: url, under: root)
+            let modifiedAt = values.contentModificationDate ?? Date.distantPast
+            let size = Int64(values.fileSize ?? 0)
+
+            let fileFingerprint: FileFingerprint
+            if let cached = cachedFiles[relativePath],
+               cached.size == size,
+               cached.modifiedAt == modifiedAt {
+                fileFingerprint = cached
+            } else {
+                fileFingerprint = try fingerprint(for: url, modifiedAt: modifiedAt, size: size)
+            }
+
+            files[relativePath] = fileFingerprint
+            if !equivalentState(fileFingerprint, baseline[relativePath]) {
+                changedFiles[relativePath] = fileFingerprint
+            }
+        }
+
+        let deletedPaths = baseline.keys
+            .filter { files[$0] == nil }
+            .sorted()
+
+        return LocalScanResult(
+            manifest: DirectoryManifest(scannedAt: scannedAt, files: files),
+            delta: DirectoryDeltaManifest(
+                scannedAt: scannedAt,
+                changedFiles: changedFiles,
+                deletedPaths: deletedPaths
+            )
+        )
+    }
+
+    func scanCurrentFiles(root: URL) throws -> [String: FileFingerprint] {
         guard fileManager.fileExists(atPath: root.path) else {
             throw DirectoryScannerError.noFolderConfigured
         }
@@ -39,7 +115,7 @@ struct DirectoryScanner {
             includingPropertiesForKeys: Array(resourceKeys),
             options: []
         ) else {
-            return DirectoryManifest(scannedAt: Date(), files: files)
+            return files
         }
 
         for case let url as URL in enumerator {
@@ -52,10 +128,12 @@ struct DirectoryScanner {
             }
 
             let relativePath = relativePath(for: url, under: root)
-            files[relativePath] = try fingerprint(for: url)
+            let modifiedAt = values.contentModificationDate ?? Date.distantPast
+            let size = Int64(values.fileSize ?? 0)
+            files[relativePath] = try fingerprint(for: url, modifiedAt: modifiedAt, size: size)
         }
 
-        return DirectoryManifest(scannedAt: Date(), files: files)
+        return files
     }
 
     func currentState(root: URL, relativePath: String) throws -> FileFingerprint? {
@@ -129,13 +207,16 @@ struct DirectoryScanner {
         let resourceValues = try url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
         let modifiedAt = resourceValues.contentModificationDate ?? Date.distantPast
         let size = Int64(resourceValues.fileSize ?? 0)
+        return try fingerprint(for: url, modifiedAt: modifiedAt, size: size)
+    }
 
+    private func fingerprint(for url: URL, modifiedAt: Date, size: Int64) throws -> FileFingerprint {
         let handle = try FileHandle(forReadingFrom: url)
         defer {
             try? handle.close()
         }
 
-        var hasher = SHA256()
+        var hasher = Insecure.MD5()
         while true {
             guard let chunk = try handle.read(upToCount: 64 * 1_024), !chunk.isEmpty else {
                 break

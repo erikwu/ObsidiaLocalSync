@@ -2,8 +2,8 @@ import Foundation
 
 enum AppConstants {
     static let appName = "SyncTwin"
-    static let appVersion = "1.0.3"
-    static let protocolVersion = 1
+    static let appVersion = "1.0.4"
+    static let protocolVersion = 2
     static let serviceType = "synctwinlan"
     static let defaultSyncIntervalSeconds = 300
     static let maxInlineFileBytes = 32 * 1_024 * 1_024

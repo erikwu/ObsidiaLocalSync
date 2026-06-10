@@ -4,12 +4,13 @@ struct SyncPlanner {
     func makePlan(
         requestID: UUID,
         baseline: [String: FileFingerprint],
-        initiator: [String: FileFingerprint],
-        responder: [String: FileFingerprint]
+        initiatorDelta: DirectoryDeltaManifest,
+        responderDelta: DirectoryDeltaManifest
     ) -> SyncPlan {
-        let allPaths = Set(baseline.keys)
-            .union(initiator.keys)
-            .union(responder.keys)
+        let allPaths = Set(initiatorDelta.changedFiles.keys)
+            .union(initiatorDelta.deletedPaths)
+            .union(responderDelta.changedFiles.keys)
+            .union(responderDelta.deletedPaths)
             .sorted()
 
         var operations: [SyncOperation] = []
@@ -18,11 +19,11 @@ struct SyncPlanner {
 
         for path in allPaths {
             let baselineState = baseline[path]
-            let initiatorState = initiator[path]
-            let responderState = responder[path]
+            let initiatorState = initiatorDelta.resolvedState(for: path, baselineState: baselineState)
+            let responderState = responderDelta.resolvedState(for: path, baselineState: baselineState)
 
-            let initiatorChanged = !equivalentState(baselineState, initiatorState)
-            let responderChanged = !equivalentState(baselineState, responderState)
+            let initiatorChanged = initiatorDelta.hasChange(at: path)
+            let responderChanged = responderDelta.hasChange(at: path)
 
             switch (initiatorChanged, responderChanged) {
             case (false, false):

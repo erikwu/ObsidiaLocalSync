@@ -132,6 +132,18 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+
+            if let estimatedCompletionDate = progress.estimatedCompletionDate {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    let remaining = max(0, estimatedCompletionDate.timeIntervalSince(context.date))
+                    if remaining > 0.5 {
+                        Text("预计剩余 \(remainingTimeText(for: remaining))")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
         }
         .padding(16)
         .background(Color.accentColor.opacity(0.08))
@@ -280,6 +292,21 @@ struct ContentView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 8))
         }
         .frame(maxWidth: .infinity)
+    }
+
+    private func remainingTimeText(for remaining: TimeInterval) -> String {
+        let totalSeconds = max(1, Int(remaining.rounded(.up)))
+        let hours = totalSeconds / 3600
+        let minutes = (totalSeconds % 3600) / 60
+        let seconds = totalSeconds % 60
+
+        if hours > 0 {
+            return String(format: "%d小时%02d分%02d秒", hours, minutes, seconds)
+        }
+        if minutes > 0 {
+            return String(format: "%d分%02d秒", minutes, seconds)
+        }
+        return "\(seconds)秒"
     }
 }
 
