@@ -154,9 +154,149 @@ struct DirectoryDeltaManifest: Codable {
     }
 }
 
+enum DirtyPathScope: String, Codable, Hashable {
+    case file
+    case subtree
+}
+
+struct DirtyPathRecord: Codable, Hashable {
+    var lastEventID: UInt64
+    var scope: DirtyPathScope
+}
+
+struct DirectoryDirtyPath: Hashable {
+    let path: String
+    let scope: DirtyPathScope
+    let lastEventID: UInt64
+}
+
+struct DirectoryChangeJournal: Codable {
+    var lastObservedEventID: UInt64
+    var requiresFullRescan: Bool
+    var trackedChanges: [String: DirtyPathRecord]
+    var updatedAt: Date
+
+    init(
+        lastObservedEventID: UInt64 = 0,
+        requiresFullRescan: Bool = false,
+        trackedChanges: [String: DirtyPathRecord] = [:],
+        updatedAt: Date = Date()
+    ) {
+        self.lastObservedEventID = lastObservedEventID
+        self.requiresFullRescan = requiresFullRescan
+        self.trackedChanges = trackedChanges
+        self.updatedAt = updatedAt
+    }
+
+    mutating func noteObservedEventID(_ eventID: UInt64) {
+        lastObservedEventID = max(lastObservedEventID, eventID)
+        updatedAt = Date()
+    }
+
+    mutating func noteFullRescanRequired(observedEventID: UInt64) {
+        noteObservedEventID(observedEventID)
+        requiresFullRescan = true
+    }
+
+    mutating func markHealthy(observedEventID: UInt64) {
+        noteObservedEventID(observedEventID)
+        requiresFullRescan = false
+    }
+
+    mutating func recordChange(path rawPath: String, scope rawScope: DirtyPathScope, eventID: UInt64) {
+        noteObservedEventID(eventID)
+
+        let path = normalizedRelativePath(rawPath)
+        let scope: DirtyPathScope = path.isEmpty ? .subtree : rawScope
+
+        if let coveringAncestor = ancestorSubtreePath(for: path), coveringAncestor != path || scope == .file {
+            if var ancestor = trackedChanges[coveringAncestor] {
+                ancestor.lastEventID = max(ancestor.lastEventID, eventID)
+                trackedChanges[coveringAncestor] = ancestor
+            }
+            return
+        }
+
+        if scope == .subtree {
+            trackedChanges = trackedChanges.filter { existingPath, _ in
+                existingPath == path || !isEqualOrDescendantPath(existingPath, of: path)
+            }
+        }
+
+        if var existing = trackedChanges[path] {
+            existing.lastEventID = max(existing.lastEventID, eventID)
+            if scope == .subtree {
+                existing.scope = .subtree
+            }
+            trackedChanges[path] = existing
+        } else {
+            trackedChanges[path] = DirtyPathRecord(lastEventID: eventID, scope: scope)
+        }
+    }
+
+    mutating func pruneChanges(upTo syncedEventID: UInt64) {
+        guard syncedEventID > 0 else {
+            return
+        }
+        trackedChanges = trackedChanges.filter { $0.value.lastEventID > syncedEventID }
+        updatedAt = Date()
+    }
+
+    func changedPaths(since eventID: UInt64) -> [DirectoryDirtyPath] {
+        trackedChanges
+            .compactMap { path, record -> DirectoryDirtyPath? in
+                guard record.lastEventID > eventID else {
+                    return nil
+                }
+                return DirectoryDirtyPath(path: path, scope: record.scope, lastEventID: record.lastEventID)
+            }
+            .sorted { lhs, rhs in
+                if lhs.path.count != rhs.path.count {
+                    return lhs.path.count < rhs.path.count
+                }
+                if lhs.path != rhs.path {
+                    return lhs.path < rhs.path
+                }
+                return lhs.scope == .subtree && rhs.scope == .file
+            }
+    }
+
+    private func ancestorSubtreePath(for path: String) -> String? {
+        if let record = trackedChanges[path], record.scope == .subtree {
+            return path
+        }
+
+        var searchPath = path
+        while let slash = searchPath.lastIndex(of: "/") {
+            searchPath = String(searchPath[..<slash])
+            if let record = trackedChanges[searchPath], record.scope == .subtree {
+                return searchPath
+            }
+        }
+
+        if let rootRecord = trackedChanges[""], rootRecord.scope == .subtree {
+            return ""
+        }
+        return nil
+    }
+}
+
+struct PeerSyncCursorState: Codable {
+    let lastSyncedLocalEventID: UInt64
+    let updatedAt: Date
+}
+
+enum DirectoryScanMode: String {
+    case full
+    case incremental
+}
+
 struct LocalScanResult {
     let manifest: DirectoryManifest
     let delta: DirectoryDeltaManifest
+    let mode: DirectoryScanMode
+    let filesystemWorkUnits: Int
+    let dirtyPathCount: Int
 }
 
 struct BaselineChange: Codable, Hashable {
@@ -408,6 +548,28 @@ func sanitizedFilenameComponent(_ raw: String) -> String {
 func stableDigestString(_ raw: String) -> String {
     let digest = Insecure.MD5.hash(data: Data(raw.utf8))
     return digest.map { String(format: "%02x", $0) }.joined()
+}
+
+func normalizedRelativePath(_ raw: String) -> String {
+    let trimmed = raw.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    return trimmed == "." ? "" : trimmed
+}
+
+func isEqualOrDescendantPath(_ path: String, of prefix: String) -> Bool {
+    let normalizedPath = normalizedRelativePath(path)
+    let normalizedPrefix = normalizedRelativePath(prefix)
+    guard !normalizedPrefix.isEmpty else {
+        return true
+    }
+    return normalizedPath == normalizedPrefix || normalizedPath.hasPrefix(normalizedPrefix + "/")
+}
+
+func parentRelativePath(of path: String) -> String {
+    let normalized = normalizedRelativePath(path)
+    guard let slash = normalized.lastIndex(of: "/") else {
+        return ""
+    }
+    return String(normalized[..<slash])
 }
 
 func conflictBackupPath(originalPath: String, losingLabel: String, conflictID: UUID) -> String {

@@ -65,16 +65,15 @@ private struct OverallSyncETAEstimate {
     }
 
     var overallFraction: Double? {
-        guard let planning = work[.planning], planning.total > 0, planning.completed >= planning.total else {
-            return nil
-        }
-
         let totalUnits = work.values.reduce(0) { $0 + $1.total }
         guard totalUnits > 0 else {
             return nil
         }
 
         let completedUnits = work.values.reduce(0) { $0 + min($1.completed, $1.total) }
+        guard completedUnits > 0 else {
+            return nil
+        }
         let fraction = min(max(completedUnits / totalUnits, 0), 0.995)
         guard fraction >= 0.02 else {
             return nil
@@ -129,14 +128,18 @@ final class SyncTwinController: NSObject, ObservableObject {
     @Published var syncProgress: SyncProgressSnapshot?
     @Published var pendingConflicts: [PendingConflict] = []
     @Published var activityItems: [ActivityItem] = []
+    @Published var updateSnapshot = AppUpdateSnapshot.idle
 
     private let storage = AppStorage.shared
     private let scanner = DirectoryScanner()
     private let planner = SyncPlanner()
+    private let updateService = GitHubReleaseUpdateService()
+    private let changeMonitor = DirectoryChangeMonitor(storage: AppStorage.shared)
 
     private var transport: PeerTransport?
     private var autoSyncTask: Task<Void, Never>?
     private var progressResetTask: Task<Void, Never>?
+    private var updateTask: Task<Void, Never>?
     private var progressStartedAt: Date?
     private var overallETAEstimate: OverallSyncETAEstimate?
     private var activeSession: ActiveSyncSession? {
@@ -156,13 +159,17 @@ final class SyncTwinController: NSObject, ObservableObject {
         super.init()
         storage.clearAllPreviewFiles()
         startTransport()
+        restartChangeMonitor()
         scheduleAutoSyncLoop()
         addLog("应用已启动，版本 \(AppConstants.appVersion)。")
+        startUpdateCheck(trigger: .automaticOnLaunch)
     }
 
     deinit {
         autoSyncTask?.cancel()
         progressResetTask?.cancel()
+        updateTask?.cancel()
+        changeMonitor.stop()
         transport?.stop()
     }
 
@@ -195,6 +202,17 @@ final class SyncTwinController: NSObject, ObservableObject {
 
     var canSyncNow: Bool {
         connectedPeerName != nil && remoteHello != nil && versionGateMessage == nil && watchedFolderURL != nil && !isSyncInProgress
+    }
+
+    var canRevealDownloadedUpdate: Bool {
+        guard let downloadedFileURL = updateSnapshot.downloadedFileURL else {
+            return false
+        }
+        return FileManager.default.fileExists(atPath: downloadedFileURL.path)
+    }
+
+    var canOpenReleasePage: Bool {
+        updateSnapshot.releasePageURL != nil
     }
 
     private struct SyncExecutionContext {
@@ -240,6 +258,7 @@ final class SyncTwinController: NSObject, ObservableObject {
         if oldDisplayName != config.deviceName {
             startTransport()
         }
+        restartChangeMonitor()
         scheduleAutoSyncLoop()
     }
 
@@ -256,6 +275,22 @@ final class SyncTwinController: NSObject, ObservableObject {
     func disconnect() {
         transport?.disconnect()
         clearConnectionState(message: "已主动断开连接。")
+    }
+
+    func checkForUpdatesManually() {
+        startUpdateCheck(trigger: .manual)
+    }
+
+    func openReleasePage() {
+        NSWorkspace.shared.open(updateSnapshot.releasePageURL ?? AppConstants.githubReleasesPageURL)
+    }
+
+    func revealDownloadedUpdate() {
+        guard let downloadedFileURL = updateSnapshot.downloadedFileURL,
+              FileManager.default.fileExists(atPath: downloadedFileURL.path) else {
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([downloadedFileURL])
     }
 
     func startManualSync() {
@@ -301,6 +336,14 @@ final class SyncTwinController: NSObject, ObservableObject {
         addLog("开始在局域网内广播设备 \(config.deviceName)。")
     }
 
+    private func restartChangeMonitor() {
+        guard let watchedFolderURL else {
+            changeMonitor.stop()
+            return
+        }
+        changeMonitor.startMonitoring(root: watchedFolderURL)
+    }
+
     private func scheduleAutoSyncLoop() {
         autoSyncTask?.cancel()
 
@@ -314,6 +357,148 @@ final class SyncTwinController: NSObject, ObservableObject {
                 try? await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000)
                 await self.maybeRunAutomaticSync()
             }
+        }
+    }
+
+    private func startUpdateCheck(trigger: UpdateCheckTrigger) {
+        guard !updateSnapshot.isBusy else {
+            return
+        }
+
+        updateTask?.cancel()
+        updateTask = Task { [weak self] in
+            await self?.performUpdateCheck(trigger: trigger)
+        }
+    }
+
+    private func performUpdateCheck(trigger: UpdateCheckTrigger) async {
+        let previousSnapshot = updateSnapshot
+        updateSnapshot = AppUpdateSnapshot(
+            phase: .checking,
+            detail: trigger == .manual
+                ? "正在检查 GitHub Release..."
+                : "启动时正在检查 GitHub Release...",
+            latestVersion: previousSnapshot.latestVersion,
+            releasePageURL: previousSnapshot.releasePageURL ?? AppConstants.githubReleasesPageURL,
+            downloadedFileURL: previousSnapshot.downloadedFileURL,
+            lastCheckedAt: previousSnapshot.lastCheckedAt,
+            assetName: previousSnapshot.assetName
+        )
+
+        if trigger == .manual {
+            addLog("正在手工检查 GitHub Release 更新。")
+        }
+
+        do {
+            let release = try await updateService.fetchLatestRelease()
+            let currentVersion = VersionIdentifier(AppConstants.appVersion)
+            let latestVersion = VersionIdentifier(release.tagName)
+            let checkedAt = Date()
+
+            guard latestVersion > currentVersion else {
+                updateSnapshot = AppUpdateSnapshot(
+                    phase: .upToDate,
+                    detail: "当前已是最新版本。",
+                    latestVersion: release.normalizedVersion,
+                    releasePageURL: release.htmlURL,
+                    downloadedFileURL: previousSnapshot.downloadedFileURL,
+                    lastCheckedAt: checkedAt,
+                    assetName: previousSnapshot.assetName
+                )
+                if trigger == .manual {
+                    addLog("已确认当前版本就是最新 GitHub Release。")
+                }
+                return
+            }
+
+            guard let asset = release.preferredAsset else {
+                let detail = "发现新版本 \(release.normalizedVersion)，但 release 中没有可自动下载的 macOS 安装包。"
+                updateSnapshot = AppUpdateSnapshot(
+                    phase: .updateAvailable,
+                    detail: detail,
+                    latestVersion: release.normalizedVersion,
+                    releasePageURL: release.htmlURL,
+                    downloadedFileURL: nil,
+                    lastCheckedAt: checkedAt,
+                    assetName: nil
+                )
+                addLog(detail)
+                return
+            }
+
+            if let downloadedFileURL = storage.existingDownloadedUpdateURL(
+                releaseTag: release.tagName,
+                assetName: asset.name
+            ) {
+                let detail = "新版本 \(release.normalizedVersion) 已经下载到本机。"
+                updateSnapshot = AppUpdateSnapshot(
+                    phase: .downloaded,
+                    detail: detail,
+                    latestVersion: release.normalizedVersion,
+                    releasePageURL: release.htmlURL,
+                    downloadedFileURL: downloadedFileURL,
+                    lastCheckedAt: checkedAt,
+                    assetName: asset.name
+                )
+                if trigger == .manual {
+                    addLog(detail)
+                }
+                return
+            }
+
+            let downloadingDetail = trigger == .manual
+                ? "发现新版本 \(release.normalizedVersion)，正在下载 \(asset.name)。"
+                : "启动时发现新版本 \(release.normalizedVersion)，正在自动下载 \(asset.name)。"
+            updateSnapshot = AppUpdateSnapshot(
+                phase: .downloading,
+                detail: downloadingDetail,
+                latestVersion: release.normalizedVersion,
+                releasePageURL: release.htmlURL,
+                downloadedFileURL: nil,
+                lastCheckedAt: checkedAt,
+                assetName: asset.name
+            )
+            addLog(downloadingDetail)
+
+            let temporaryURL = try await updateService.downloadAsset(asset)
+            let downloadedFileURL = try storage.storeDownloadedUpdate(
+                from: temporaryURL,
+                releaseTag: release.tagName,
+                assetName: asset.name
+            )
+
+            let downloadedDetail = "新版本 \(release.normalizedVersion) 已下载完成。"
+            updateSnapshot = AppUpdateSnapshot(
+                phase: .downloaded,
+                detail: downloadedDetail,
+                latestVersion: release.normalizedVersion,
+                releasePageURL: release.htmlURL,
+                downloadedFileURL: downloadedFileURL,
+                lastCheckedAt: checkedAt,
+                assetName: asset.name
+            )
+            addLog("\(downloadedDetail) 文件：\(downloadedFileURL.lastPathComponent)。")
+        } catch is CancellationError {
+            return
+        } catch {
+            let detail: String
+            switch trigger {
+            case .automaticOnLaunch:
+                detail = "自动检查更新失败，可稍后手动查看更新。"
+            case .manual:
+                detail = "检查更新失败：\(error.localizedDescription)"
+            }
+
+            updateSnapshot = AppUpdateSnapshot(
+                phase: .failed,
+                detail: detail,
+                latestVersion: previousSnapshot.latestVersion,
+                releasePageURL: previousSnapshot.releasePageURL ?? AppConstants.githubReleasesPageURL,
+                downloadedFileURL: previousSnapshot.downloadedFileURL,
+                lastCheckedAt: Date(),
+                assetName: previousSnapshot.assetName
+            )
+            addLog(detail)
         }
     }
 
@@ -412,7 +597,7 @@ final class SyncTwinController: NSObject, ObservableObject {
             )
             markETAWorkComplete(
                 .localScan,
-                total: Double(max(estimatedLocalScanUnits, localScanResult.manifest.files.count, 1)),
+                total: Double(max(estimatedLocalScanUnits, localScanResult.filesystemWorkUnits, 1)),
                 requestID: context.requestID
             )
             pendingLocalManifests[context.requestID] = localScanResult.manifest.files
@@ -612,10 +797,16 @@ final class SyncTwinController: NSObject, ObservableObject {
             completeSyncProgress(phase: "同步完成", detail: statusText)
             addLog(statusText)
             if let finalManifest = pendingLocalManifests[context.requestID] {
-                try storage.saveLocalFingerprintCache(
-                    finalManifest,
+                try await persistLocalSyncState(
                     for: context.peerHello.deviceID,
-                    rootPath: context.root.path
+                    root: context.root,
+                    fullManifest: finalManifest
+                )
+            } else {
+                try await persistLocalSyncState(
+                    for: context.peerHello.deviceID,
+                    root: context.root,
+                    changedPaths: Set(commitChanges.map(\.path))
                 )
             }
             pendingLocalManifests.removeValue(forKey: context.requestID)
@@ -858,6 +1049,11 @@ final class SyncTwinController: NSObject, ObservableObject {
             }
 
             if !failurePaths.isEmpty {
+                try await persistLocalSyncState(
+                    for: peerHello.deviceID,
+                    root: root,
+                    changedPaths: Set(baselineChanges.map(\.path))
+                )
                 statusText = "冲突处理部分完成，建议重新同步确认最新状态。"
                 completeSyncProgress(phase: "冲突处理部分完成", detail: statusText)
                 addLog(statusText)
@@ -878,6 +1074,11 @@ final class SyncTwinController: NSObject, ObservableObject {
                 CommitBaselineMessage(requestID: requestID, changes: baselineChanges),
                 kind: .commitBaseline,
                 to: peerName
+            )
+            try await persistLocalSyncState(
+                for: peerHello.deviceID,
+                root: root,
+                changedPaths: Set(baselineChanges.map(\.path))
             )
 
             pendingConflicts.removeAll { $0.id == pending.id }
@@ -1490,9 +1691,31 @@ final class SyncTwinController: NSObject, ObservableObject {
         peerDeviceID: String
     ) async throws -> LocalScanResult {
         let scanner = DirectoryScanner()
+        changeMonitor.flushPendingEvents(for: root)
         let cachedFiles = storage.loadLocalFingerprintCache(for: peerDeviceID, rootPath: root.path)
+        let hasCachedManifest = storage.hasLocalFingerprintCache(for: peerDeviceID, rootPath: root.path)
+        let peerCursor = storage.loadPeerSyncCursor(for: peerDeviceID, rootPath: root.path)
+        let journal = changeMonitor.journalSnapshot(for: root)
+        let canUseIncremental = {
+            guard let peerCursor, hasCachedManifest else {
+                return false
+            }
+            return !journal.requiresFullRescan && journal.lastObservedEventID >= peerCursor.lastSyncedLocalEventID
+        }()
+        let dirtyPaths = canUseIncremental && peerCursor != nil
+            ? journal.changedPaths(since: peerCursor!.lastSyncedLocalEventID)
+            : []
+
         return try await Task.detached(priority: .userInitiated) {
-            try scanner.scan(root: root, cachedFiles: cachedFiles, baseline: baseline)
+            if canUseIncremental {
+                return try scanner.scanIncremental(
+                    root: root,
+                    cachedFiles: cachedFiles,
+                    baseline: baseline,
+                    dirtyPaths: dirtyPaths
+                )
+            }
+            return try scanner.scan(root: root, cachedFiles: cachedFiles, baseline: baseline)
         }.value
     }
 
@@ -1532,7 +1755,44 @@ final class SyncTwinController: NSObject, ObservableObject {
         baseline: [String: FileFingerprint]
     ) -> Int {
         let cachedFiles = storage.loadLocalFingerprintCache(for: peerDeviceID, rootPath: root.path)
+        if storage.hasLocalFingerprintCache(for: peerDeviceID, rootPath: root.path),
+           let peerCursor = storage.loadPeerSyncCursor(for: peerDeviceID, rootPath: root.path) {
+            let journal = changeMonitor.journalSnapshot(for: root)
+            if !journal.requiresFullRescan && journal.lastObservedEventID >= peerCursor.lastSyncedLocalEventID {
+                return max(1, journal.changedPaths(since: peerCursor.lastSyncedLocalEventID).count)
+            }
+        }
         return max(1, cachedFiles.count, baseline.count)
+    }
+
+    private func persistLocalSyncState(
+        for peerDeviceID: String,
+        root: URL,
+        fullManifest: [String: FileFingerprint]? = nil,
+        changedPaths: Set<String> = []
+    ) async throws {
+        let manifest: [String: FileFingerprint]
+        if let fullManifest {
+            manifest = fullManifest
+        } else {
+            var refreshedManifest = storage.loadLocalFingerprintCache(for: peerDeviceID, rootPath: root.path)
+            if !changedPaths.isEmpty {
+                try await refreshManifestEntries(
+                    &refreshedManifest,
+                    root: root,
+                    relativePaths: changedPaths
+                )
+            }
+            manifest = refreshedManifest
+        }
+
+        try storage.saveLocalFingerprintCache(manifest, for: peerDeviceID, rootPath: root.path)
+        let eventID = changeMonitor.markSynchronizedAndCaptureEventID(for: root)
+        try storage.savePeerSyncCursor(
+            PeerSyncCursorState(lastSyncedLocalEventID: eventID, updatedAt: Date()),
+            for: peerDeviceID,
+            rootPath: root.path
+        )
     }
 
     private func estimatedCurrentFileCount(
@@ -1870,7 +2130,9 @@ extension SyncTwinController: PeerTransportDelegate {
 
             case .commitBaseline:
                 let message = try SyncMessageCodec.decodePayload(CommitBaselineMessage.self, from: envelope)
-                handleCommitBaseline(message)
+                Task {
+                    await handleCommitBaseline(message)
+                }
 
             case .resolutionBundle:
                 let message = try SyncMessageCodec.decodePayload(ResolutionBundleMessage.self, from: envelope)
@@ -2080,7 +2342,7 @@ extension SyncTwinController {
             )
             markETAWorkComplete(
                 .localScan,
-                total: Double(max(estimatedLocalScanUnits, localScanResult.manifest.files.count, 1)),
+                total: Double(max(estimatedLocalScanUnits, localScanResult.filesystemWorkUnits, 1)),
                 requestID: message.requestID
             )
             pendingLocalManifests[message.requestID] = localScanResult.manifest.files
@@ -2427,11 +2689,12 @@ extension SyncTwinController {
         )
     }
 
-    private func handleCommitBaseline(_ message: CommitBaselineMessage) {
+    private func handleCommitBaseline(_ message: CommitBaselineMessage) async {
         guard let remoteHello else {
             return
         }
         let rootPath = watchedFolderURL?.path ?? config.watchedFolderPath
+        let root = watchedFolderURL
         let shouldCompleteResponderProgress = isResponderSession(requestID: message.requestID)
         defer {
             releaseActiveSessionIfMatches(message.requestID)
@@ -2441,11 +2704,17 @@ extension SyncTwinController {
             updateBaseline(&baseline, with: message.changes)
             try storage.saveBaseline(baseline, for: remoteHello.deviceID, rootPath: rootPath)
             addLog("已提交 \(message.changes.count) 条同步基线更新。")
-            if let root = watchedFolderURL, let manifest = pendingLocalManifests[message.requestID] {
-                try storage.saveLocalFingerprintCache(
-                    manifest,
+            if let root, let manifest = pendingLocalManifests[message.requestID] {
+                try await persistLocalSyncState(
                     for: remoteHello.deviceID,
-                    rootPath: root.path
+                    root: root,
+                    fullManifest: manifest
+                )
+            } else if let root {
+                try await persistLocalSyncState(
+                    for: remoteHello.deviceID,
+                    root: root,
+                    changedPaths: Set(message.changes.map(\.path))
                 )
             }
             pendingLocalManifests.removeValue(forKey: message.requestID)

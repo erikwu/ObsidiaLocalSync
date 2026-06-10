@@ -96,6 +96,61 @@ struct ContentView: View {
                 Toggle("自动同步完成时播放提示音", isOn: $controller.config.autoSyncCompletionSoundEnabled)
                     .disabled(!controller.config.autoSyncEnabled)
 
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("应用更新")
+                        .font(.headline)
+
+                    HStack(alignment: .center, spacing: 10) {
+                        Text(controller.updateSnapshot.detail)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                        if controller.updateSnapshot.isBusy {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                    }
+
+                    if let latestVersion = controller.updateSnapshot.latestVersion {
+                        Text("最新 release \(latestVersion)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if let downloadedFileURL = controller.updateSnapshot.downloadedFileURL {
+                        Text(downloadedFileURL.lastPathComponent)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+
+                    HStack(spacing: 12) {
+                        Button("查看更新") {
+                            controller.checkForUpdatesManually()
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(controller.updateSnapshot.isBusy)
+
+                        Button("打开发布页") {
+                            controller.openReleasePage()
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(!controller.canOpenReleasePage)
+
+                        Button("在访达中显示") {
+                            controller.revealDownloadedUpdate()
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(!controller.canRevealDownloadedUpdate)
+                    }
+
+                    if let lastCheckedAt = controller.updateSnapshot.lastCheckedAt {
+                        Text("上次检查 \(lastCheckedAt.formatted(date: .omitted, time: .shortened))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 HStack(spacing: 12) {
                     Button("保存设置") {
                         controller.saveSettings()

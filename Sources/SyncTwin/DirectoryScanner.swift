@@ -20,6 +20,13 @@ enum DirectoryScannerError: LocalizedError {
 
 struct DirectoryScanner {
     private let fileManager = FileManager.default
+    private let resourceKeys: Set<URLResourceKey> = [
+        .isRegularFileKey,
+        .isDirectoryKey,
+        .isSymbolicLinkKey,
+        .contentModificationDateKey,
+        .fileSizeKey,
+    ]
 
     func scan(
         root: URL,
@@ -31,69 +38,56 @@ struct DirectoryScanner {
         }
 
         let scannedAt = Date()
-        var files: [String: FileFingerprint] = [:]
-        var changedFiles: [String: FileFingerprint] = [:]
-        let resourceKeys: Set<URLResourceKey> = [
-            .isRegularFileKey,
-            .isSymbolicLinkKey,
-            .contentModificationDateKey,
-            .fileSizeKey,
-        ]
-
-        guard let enumerator = fileManager.enumerator(
+        let scan = try enumerateFiles(
             at: root,
-            includingPropertiesForKeys: Array(resourceKeys),
-            options: []
-        ) else {
-            return LocalScanResult(
-                manifest: DirectoryManifest(scannedAt: scannedAt, files: files),
-                delta: DirectoryDeltaManifest(
-                    scannedAt: scannedAt,
-                    changedFiles: [:],
-                    deletedPaths: baseline.keys.sorted()
-                )
+            root: root,
+            cachedFiles: cachedFiles
+        )
+
+        return makeScanResult(
+            files: scan.files,
+            baseline: baseline,
+            scannedAt: scannedAt,
+            mode: .full,
+            filesystemWorkUnits: max(1, scan.workUnits),
+            dirtyPathCount: max(1, scan.files.count)
+        )
+    }
+
+    func scanIncremental(
+        root: URL,
+        cachedFiles: [String: FileFingerprint],
+        baseline: [String: FileFingerprint],
+        dirtyPaths: [DirectoryDirtyPath]
+    ) throws -> LocalScanResult {
+        guard fileManager.fileExists(atPath: root.path) else {
+            throw DirectoryScannerError.noFolderConfigured
+        }
+
+        let normalizedDirtyPaths = normalizeDirtyPaths(dirtyPaths)
+        if normalizedDirtyPaths.contains(where: { $0.scope == .subtree && $0.path.isEmpty }) {
+            return try scan(root: root, cachedFiles: cachedFiles, baseline: baseline)
+        }
+
+        let scannedAt = Date()
+        var files = cachedFiles
+        var filesystemWorkUnits = 0
+
+        for dirtyPath in normalizedDirtyPaths {
+            filesystemWorkUnits += try refreshCachedEntries(
+                &files,
+                root: root,
+                dirtyPath: dirtyPath
             )
         }
 
-        for case let url as URL in enumerator {
-            let values = try url.resourceValues(forKeys: resourceKeys)
-            if values.isSymbolicLink == true {
-                continue
-            }
-            guard values.isRegularFile == true else {
-                continue
-            }
-
-            let relativePath = relativePath(for: url, under: root)
-            let modifiedAt = values.contentModificationDate ?? Date.distantPast
-            let size = Int64(values.fileSize ?? 0)
-
-            let fileFingerprint: FileFingerprint
-            if let cached = cachedFiles[relativePath],
-               cached.size == size,
-               cached.modifiedAt == modifiedAt {
-                fileFingerprint = cached
-            } else {
-                fileFingerprint = try fingerprint(for: url, modifiedAt: modifiedAt, size: size)
-            }
-
-            files[relativePath] = fileFingerprint
-            if !equivalentState(fileFingerprint, baseline[relativePath]) {
-                changedFiles[relativePath] = fileFingerprint
-            }
-        }
-
-        let deletedPaths = baseline.keys
-            .filter { files[$0] == nil }
-            .sorted()
-
-        return LocalScanResult(
-            manifest: DirectoryManifest(scannedAt: scannedAt, files: files),
-            delta: DirectoryDeltaManifest(
-                scannedAt: scannedAt,
-                changedFiles: changedFiles,
-                deletedPaths: deletedPaths
-            )
+        return makeScanResult(
+            files: files,
+            baseline: baseline,
+            scannedAt: scannedAt,
+            mode: .incremental,
+            filesystemWorkUnits: max(filesystemWorkUnits, normalizedDirtyPaths.isEmpty ? 0 : 1),
+            dirtyPathCount: normalizedDirtyPaths.count
         )
     }
 
@@ -102,38 +96,7 @@ struct DirectoryScanner {
             throw DirectoryScannerError.noFolderConfigured
         }
 
-        var files: [String: FileFingerprint] = [:]
-        let resourceKeys: Set<URLResourceKey> = [
-            .isRegularFileKey,
-            .isSymbolicLinkKey,
-            .contentModificationDateKey,
-            .fileSizeKey,
-        ]
-
-        guard let enumerator = fileManager.enumerator(
-            at: root,
-            includingPropertiesForKeys: Array(resourceKeys),
-            options: []
-        ) else {
-            return files
-        }
-
-        for case let url as URL in enumerator {
-            let values = try url.resourceValues(forKeys: resourceKeys)
-            if values.isSymbolicLink == true {
-                continue
-            }
-            guard values.isRegularFile == true else {
-                continue
-            }
-
-            let relativePath = relativePath(for: url, under: root)
-            let modifiedAt = values.contentModificationDate ?? Date.distantPast
-            let size = Int64(values.fileSize ?? 0)
-            files[relativePath] = try fingerprint(for: url, modifiedAt: modifiedAt, size: size)
-        }
-
-        return files
+        return try enumerateFiles(at: root, root: root, cachedFiles: [:]).files
     }
 
     func currentState(root: URL, relativePath: String) throws -> FileFingerprint? {
@@ -194,6 +157,240 @@ struct DirectoryScanner {
 
     func absoluteURL(root: URL, relativePath: String) -> URL {
         root.appendingPathComponent(relativePath)
+    }
+
+    private func makeScanResult(
+        files: [String: FileFingerprint],
+        baseline: [String: FileFingerprint],
+        scannedAt: Date,
+        mode: DirectoryScanMode,
+        filesystemWorkUnits: Int,
+        dirtyPathCount: Int
+    ) -> LocalScanResult {
+        var changedFiles: [String: FileFingerprint] = [:]
+        for (path, fingerprint) in files where !equivalentState(fingerprint, baseline[path]) {
+            changedFiles[path] = fingerprint
+        }
+
+        let deletedPaths = baseline.keys
+            .filter { files[$0] == nil }
+            .sorted()
+
+        return LocalScanResult(
+            manifest: DirectoryManifest(scannedAt: scannedAt, files: files),
+            delta: DirectoryDeltaManifest(
+                scannedAt: scannedAt,
+                changedFiles: changedFiles,
+                deletedPaths: deletedPaths
+            ),
+            mode: mode,
+            filesystemWorkUnits: filesystemWorkUnits,
+            dirtyPathCount: dirtyPathCount
+        )
+    }
+
+    private func normalizeDirtyPaths(_ dirtyPaths: [DirectoryDirtyPath]) -> [DirectoryDirtyPath] {
+        var normalized: [DirectoryDirtyPath] = []
+
+        for dirtyPath in dirtyPaths.sorted(by: dirtyPathComparator) {
+            if normalized.contains(where: { $0.scope == .subtree && isEqualOrDescendantPath(dirtyPath.path, of: $0.path) }) {
+                continue
+            }
+
+            if dirtyPath.scope == .subtree {
+                normalized.removeAll { isEqualOrDescendantPath($0.path, of: dirtyPath.path) }
+            } else if let index = normalized.firstIndex(where: { $0.path == dirtyPath.path }) {
+                if normalized[index].lastEventID >= dirtyPath.lastEventID {
+                    continue
+                }
+                normalized[index] = dirtyPath
+                continue
+            }
+
+            normalized.append(dirtyPath)
+        }
+
+        return normalized.sorted(by: dirtyPathComparator)
+    }
+
+    private func dirtyPathComparator(_ lhs: DirectoryDirtyPath, _ rhs: DirectoryDirtyPath) -> Bool {
+        if lhs.path.count != rhs.path.count {
+            return lhs.path.count < rhs.path.count
+        }
+        if lhs.path != rhs.path {
+            return lhs.path < rhs.path
+        }
+        return lhs.scope == .subtree && rhs.scope == .file
+    }
+
+    private func refreshCachedEntries(
+        _ files: inout [String: FileFingerprint],
+        root: URL,
+        dirtyPath: DirectoryDirtyPath
+    ) throws -> Int {
+        switch dirtyPath.scope {
+        case .file:
+            return try refreshExactPath(&files, root: root, relativePath: dirtyPath.path)
+        case .subtree:
+            return try refreshSubtree(&files, root: root, relativePath: dirtyPath.path)
+        }
+    }
+
+    private func refreshExactPath(
+        _ files: inout [String: FileFingerprint],
+        root: URL,
+        relativePath: String
+    ) throws -> Int {
+        let cachedSnapshot = files
+        let url = absoluteURL(root: root, relativePath: relativePath)
+
+        guard fileManager.fileExists(atPath: url.path) else {
+            removeEntries(in: &files, matching: relativePath)
+            return 1
+        }
+
+        let values = try url.resourceValues(forKeys: resourceKeys)
+        if values.isDirectory == true {
+            return try refreshSubtree(&files, root: root, relativePath: relativePath)
+        }
+        if values.isSymbolicLink == true || values.isRegularFile != true {
+            removeEntries(in: &files, matching: relativePath)
+            return 1
+        }
+
+        removeDescendants(of: relativePath, in: &files)
+
+        let modifiedAt = values.contentModificationDate ?? Date.distantPast
+        let size = Int64(values.fileSize ?? 0)
+        if let cached = cachedSnapshot[relativePath],
+           cached.size == size,
+           cached.modifiedAt == modifiedAt {
+            files[relativePath] = cached
+        } else {
+            files[relativePath] = try fingerprint(for: url, modifiedAt: modifiedAt, size: size)
+        }
+        return 1
+    }
+
+    private func refreshSubtree(
+        _ files: inout [String: FileFingerprint],
+        root: URL,
+        relativePath: String
+    ) throws -> Int {
+        let cachedSnapshot = files
+        let url = relativePath.isEmpty ? root : absoluteURL(root: root, relativePath: relativePath)
+
+        guard fileManager.fileExists(atPath: url.path) else {
+            removeEntries(in: &files, matching: relativePath)
+            return 1
+        }
+
+        let values = try url.resourceValues(forKeys: resourceKeys)
+        if values.isSymbolicLink == true {
+            removeEntries(in: &files, matching: relativePath)
+            return 1
+        }
+
+        if values.isRegularFile == true {
+            removeEntries(in: &files, matching: relativePath)
+
+            let modifiedAt = values.contentModificationDate ?? Date.distantPast
+            let size = Int64(values.fileSize ?? 0)
+            if let cached = cachedSnapshot[relativePath],
+               cached.size == size,
+               cached.modifiedAt == modifiedAt {
+                files[relativePath] = cached
+            } else {
+                files[relativePath] = try fingerprint(for: url, modifiedAt: modifiedAt, size: size)
+            }
+            return 1
+        }
+
+        guard values.isDirectory == true else {
+            removeEntries(in: &files, matching: relativePath)
+            return 1
+        }
+
+        let subtreeScan = try enumerateFiles(at: url, root: root, cachedFiles: cachedSnapshot)
+        removeEntries(in: &files, matching: relativePath)
+        files.merge(subtreeScan.files) { _, new in new }
+        return max(1, subtreeScan.workUnits)
+    }
+
+    private func enumerateFiles(
+        at directoryURL: URL,
+        root: URL,
+        cachedFiles: [String: FileFingerprint]
+    ) throws -> (files: [String: FileFingerprint], workUnits: Int) {
+        var files: [String: FileFingerprint] = [:]
+        var workUnits = 0
+
+        if directoryURL != root {
+            let rootValues = try directoryURL.resourceValues(forKeys: resourceKeys)
+            if rootValues.isSymbolicLink == true || rootValues.isDirectory != true {
+                return (files, 1)
+            }
+        }
+
+        guard let enumerator = fileManager.enumerator(
+            at: directoryURL,
+            includingPropertiesForKeys: Array(resourceKeys),
+            options: []
+        ) else {
+            return (files, max(1, workUnits))
+        }
+
+        for case let url as URL in enumerator {
+            let values = try url.resourceValues(forKeys: resourceKeys)
+            if values.isSymbolicLink == true {
+                continue
+            }
+            guard values.isRegularFile == true else {
+                continue
+            }
+
+            workUnits += 1
+            let relativePath = relativePath(for: url, under: root)
+            let modifiedAt = values.contentModificationDate ?? Date.distantPast
+            let size = Int64(values.fileSize ?? 0)
+
+            if let cached = cachedFiles[relativePath],
+               cached.size == size,
+               cached.modifiedAt == modifiedAt {
+                files[relativePath] = cached
+            } else {
+                files[relativePath] = try fingerprint(for: url, modifiedAt: modifiedAt, size: size)
+            }
+        }
+
+        return (files, max(1, workUnits))
+    }
+
+    private func removeEntries(
+        in files: inout [String: FileFingerprint],
+        matching relativePath: String
+    ) {
+        if relativePath.isEmpty {
+            files.removeAll()
+            return
+        }
+
+        files = files.filter { path, _ in
+            !isEqualOrDescendantPath(path, of: relativePath)
+        }
+    }
+
+    private func removeDescendants(
+        of relativePath: String,
+        in files: inout [String: FileFingerprint]
+    ) {
+        guard !relativePath.isEmpty else {
+            return
+        }
+
+        files = files.filter { path, _ in
+            path == relativePath || !path.hasPrefix(relativePath + "/")
+        }
     }
 
     private func relativePath(for url: URL, under root: URL) -> String {

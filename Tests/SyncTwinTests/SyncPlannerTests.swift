@@ -13,8 +13,8 @@ final class SyncPlannerTests: XCTestCase {
         let plan = planner.makePlan(
             requestID: UUID(),
             baseline: baseline,
-            initiator: initiator,
-            responder: responder
+            initiatorDelta: delta(changed: initiator),
+            responderDelta: delta(changed: responder)
         )
 
         XCTAssertEqual(plan.operations.count, 1)
@@ -31,8 +31,8 @@ final class SyncPlannerTests: XCTestCase {
         let plan = planner.makePlan(
             requestID: UUID(),
             baseline: baseline,
-            initiator: ["doc.md": changed],
-            responder: ["doc.md": changed]
+            initiatorDelta: delta(changed: ["doc.md": changed]),
+            responderDelta: delta(changed: ["doc.md": changed])
         )
 
         XCTAssertTrue(plan.operations.isEmpty)
@@ -46,8 +46,8 @@ final class SyncPlannerTests: XCTestCase {
         let plan = planner.makePlan(
             requestID: UUID(),
             baseline: baseline,
-            initiator: ["spreadsheet.csv": fingerprint(hash: "left")],
-            responder: ["spreadsheet.csv": fingerprint(hash: "right")]
+            initiatorDelta: delta(changed: ["spreadsheet.csv": fingerprint(hash: "left")]),
+            responderDelta: delta(changed: ["spreadsheet.csv": fingerprint(hash: "right")])
         )
 
         XCTAssertTrue(plan.operations.isEmpty)
@@ -61,8 +61,8 @@ final class SyncPlannerTests: XCTestCase {
         let plan = planner.makePlan(
             requestID: UUID(),
             baseline: baseline,
-            initiator: [:],
-            responder: ["archive.zip": fingerprint(hash: "newer")]
+            initiatorDelta: delta(deleted: ["archive.zip"]),
+            responderDelta: delta(changed: ["archive.zip": fingerprint(hash: "newer")])
         )
 
         XCTAssertTrue(plan.operations.isEmpty)
@@ -75,6 +75,17 @@ final class SyncPlannerTests: XCTestCase {
             contentHash: hash,
             size: Int64(hash.count),
             modifiedAt: Date(timeIntervalSince1970: 1_717_171_717)
+        )
+    }
+
+    private func delta(
+        changed: [String: FileFingerprint] = [:],
+        deleted: [String] = []
+    ) -> DirectoryDeltaManifest {
+        DirectoryDeltaManifest(
+            scannedAt: Date(timeIntervalSince1970: 1_717_171_717),
+            changedFiles: changed,
+            deletedPaths: deleted
         )
     }
 }

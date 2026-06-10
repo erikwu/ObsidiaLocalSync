@@ -18,6 +18,7 @@ let package = Package(
             name: "SyncTwin",
             linkerSettings: [
                 .linkedFramework("AppKit"),
+                .linkedFramework("CoreServices"),
                 .linkedFramework("MultipeerConnectivity"),
                 .linkedFramework("SwiftUI"),
             ]
