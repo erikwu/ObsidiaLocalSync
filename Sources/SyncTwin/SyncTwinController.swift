@@ -177,7 +177,7 @@ final class SyncTwinController: NSObject, ObservableObject {
         guard !config.watchedFolderPath.isEmpty else {
             return nil
         }
-        return URL(fileURLWithPath: config.watchedFolderPath, isDirectory: true)
+        return URL(fileURLWithPath: canonicalDirectoryRootPath(config.watchedFolderPath), isDirectory: true)
     }
 
     var watchedFolderDisplayName: String {
@@ -225,6 +225,12 @@ final class SyncTwinController: NSObject, ObservableObject {
     }
 
     func pickFolder() {
+        guard !isSyncInProgress else {
+            statusText = "请等待当前同步结束后再切换同步目录。"
+            addLog(statusText)
+            return
+        }
+
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -232,19 +238,34 @@ final class SyncTwinController: NSObject, ObservableObject {
         panel.prompt = "选择目录"
 
         if panel.runModal() == .OK, let url = panel.url {
-            config.watchedFolderPath = url.path
-            saveSettings()
+            let previousFolderPath = config.watchedFolderPath
+            let selectedPath = canonicalDirectoryRootPath(url.path)
+            config.watchedFolderPath = selectedPath
+            saveSettings(
+                previousWatchedFolderPath: previousFolderPath,
+                forceResetSyncStateForCurrentFolder: !selectedPath.isEmpty
+            )
         }
     }
 
-    func saveSettings() {
+    func saveSettings(
+        previousWatchedFolderPath: String? = nil,
+        forceResetSyncStateForCurrentFolder: Bool = false
+    ) {
         let oldDisplayName = transport?.localPeerID.displayName
+        let normalizedPreviousFolderPath = canonicalDirectoryRootPath(
+            previousWatchedFolderPath ?? config.watchedFolderPath
+        )
 
         config.deviceName = config.deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
         if config.deviceName.isEmpty {
             config.deviceName = Host.current().localizedName ?? "Mac"
         }
         config.syncIntervalSeconds = max(60, config.syncIntervalSeconds)
+        config.watchedFolderPath = canonicalDirectoryRootPath(config.watchedFolderPath)
+
+        let folderChanged = normalizedPreviousFolderPath != config.watchedFolderPath
+        let shouldResetSyncState = forceResetSyncStateForCurrentFolder || folderChanged
 
         do {
             try storage.saveConfiguration(config)
@@ -253,6 +274,19 @@ final class SyncTwinController: NSObject, ObservableObject {
         } catch {
             statusText = "保存设置失败：\(error.localizedDescription)"
             addLog(statusText)
+        }
+
+        if shouldResetSyncState, !config.watchedFolderPath.isEmpty {
+            do {
+                try storage.clearSyncState(rootPath: config.watchedFolderPath)
+                pendingConflicts.removeAll()
+                storage.clearAllPreviewFiles()
+                addLog("已清除当前同步目录对应的历史基线与缓存，避免旧同步历史误用于当前目录。")
+            } catch {
+                let message = "清理当前同步目录的历史同步状态失败：\(error.localizedDescription)"
+                statusText = message
+                addLog(message)
+            }
         }
 
         if oldDisplayName != config.deviceName {

@@ -89,6 +89,7 @@ struct ContentView: View {
                             controller.pickFolder()
                         }
                         .buttonStyle(.bordered)
+                        .disabled(controller.isSyncInProgress)
                     }
                 }
 

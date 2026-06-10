@@ -113,6 +113,21 @@ final class AppStorage {
         try pruneDirectoryChangeJournal(rootPath: rootPath)
     }
 
+    func clearSyncState(rootPath: String) throws {
+        try prepareDirectories()
+
+        let normalizedRootPath = canonicalDirectoryRootPath(rootPath)
+        guard !normalizedRootPath.isEmpty else {
+            return
+        }
+
+        let directoryKey = stableDigestString(normalizedRootPath)
+        try removeFiles(in: baselinesDirectoryURL, matchingSuffix: "-\(directoryKey).json")
+        try removeFiles(in: localCachesDirectoryURL, matchingSuffix: "-\(directoryKey).json")
+        try removeItemIfExists(at: directoryChangeJournalURL(for: normalizedRootPath))
+        try removeItemIfExists(at: peerSyncCursorDirectoryURL(for: normalizedRootPath))
+    }
+
     func clearDirectoryChangeJournalFullRescanFlag(rootPath: String, observedEventID: UInt64) throws {
         var journal = loadDirectoryChangeJournal(rootPath: rootPath)
         journal.markHealthy(observedEventID: observedEventID)
@@ -157,14 +172,14 @@ final class AppStorage {
     }
 
     private func baselineURL(for peerDeviceID: String, rootPath: String) -> URL {
-        let directoryKey = stableDigestString(rootPath)
+        let directoryKey = stableDigestString(canonicalDirectoryRootPath(rootPath))
         return baselinesDirectoryURL
             .appendingPathComponent("\(sanitizedFilenameComponent(peerDeviceID))-\(directoryKey)")
             .appendingPathExtension("json")
     }
 
     private func localFingerprintCacheURL(for peerDeviceID: String, rootPath: String) -> URL {
-        let directoryKey = stableDigestString(rootPath)
+        let directoryKey = stableDigestString(canonicalDirectoryRootPath(rootPath))
         return localCachesDirectoryURL
             .appendingPathComponent("\(sanitizedFilenameComponent(peerDeviceID))-\(directoryKey)")
             .appendingPathExtension("json")
@@ -172,12 +187,15 @@ final class AppStorage {
 
     private func directoryChangeJournalURL(for rootPath: String) -> URL {
         journalsDirectoryURL
-            .appendingPathComponent(stableDigestString(rootPath))
+            .appendingPathComponent(stableDigestString(canonicalDirectoryRootPath(rootPath)))
             .appendingPathExtension("json")
     }
 
     private func peerSyncCursorDirectoryURL(for rootPath: String) -> URL {
-        peerCursorsDirectoryURL.appendingPathComponent(stableDigestString(rootPath), isDirectory: true)
+        peerCursorsDirectoryURL.appendingPathComponent(
+            stableDigestString(canonicalDirectoryRootPath(rootPath)),
+            isDirectory: true
+        )
     }
 
     private func peerSyncCursorURL(for peerDeviceID: String, rootPath: String) -> URL {
@@ -228,5 +246,19 @@ final class AppStorage {
 
         journal.pruneChanges(upTo: minimumCursor)
         try saveDirectoryChangeJournal(journal, rootPath: rootPath)
+    }
+
+    private func removeFiles(in directoryURL: URL, matchingSuffix suffix: String) throws {
+        let contents = try fileManager.contentsOfDirectory(at: directoryURL, includingPropertiesForKeys: nil)
+        for url in contents where url.lastPathComponent.hasSuffix(suffix) {
+            try fileManager.removeItem(at: url)
+        }
+    }
+
+    private func removeItemIfExists(at url: URL) throws {
+        guard fileManager.fileExists(atPath: url.path) else {
+            return
+        }
+        try fileManager.removeItem(at: url)
     }
 }

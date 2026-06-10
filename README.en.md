@@ -12,6 +12,7 @@
   - A manual sync already in progress blocks scheduled sync from starting.
   - If both sides trigger sync at nearly the same time, only one side wins the session; the other side automatically yields and becomes the responder.
 - Auto-sync is initiated by only one side: a stable device ID is used to pick the leader and avoid both timers initiating at once.
+- When the sync directory is changed or reselected, the app clears that directory's historical baseline, cache, and sync cursor so that old sync history is not reused for the current directory.
 - Changes are detected using a "shared baseline + content hash" model:
   - Changed on only one side: auto-sync to the other side.
   - Changed on both sides but with identical content: update the baseline automatically without bothering the user.

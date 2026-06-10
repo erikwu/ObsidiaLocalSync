@@ -1,7 +1,7 @@
 # SyncTwin Product Design Document (Current Version)
 
 - Scope: product requirements and flow design based on the current repository implementation
-- App version: `1.0.8`
+- App version: `1.0.9`
 - Protocol version: `2`
 - Updated on: `2026-06-10`
 - Chinese version: [SyncTwin_Product_Design.md](./SyncTwin_Product_Design.md)
@@ -60,6 +60,7 @@ The current sync data plane is local and nearby. App update checking and install
 3. When auto-sync is enabled, the timer should attempt sync automatically when the interval elapses.
 4. If a sync session is already running, a new scheduled sync must not start.
 5. If the local app is currently running an automatic sync and the user clicks "Sync Now," the current session should be promoted to manual semantics, including UI state and completion sound behavior.
+6. When the sync directory is changed or reselected, the app must clear that directory's historical baseline, cache, and cursor so that stale sync history from an old directory or old session cannot affect the current directory.
 
 ### 4.4 Version and Compatibility
 

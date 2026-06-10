@@ -590,6 +590,14 @@ func sanitizedFilenameComponent(_ raw: String) -> String {
     return candidate.isEmpty ? "peer" : candidate
 }
 
+func canonicalDirectoryRootPath(_ raw: String) -> String {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+        return ""
+    }
+    return URL(fileURLWithPath: trimmed, isDirectory: true).standardizedFileURL.path
+}
+
 func stableDigestString(_ raw: String) -> String {
     let digest = Insecure.MD5.hash(data: Data(raw.utf8))
     return digest.map { String(format: "%02x", $0) }.joined()
