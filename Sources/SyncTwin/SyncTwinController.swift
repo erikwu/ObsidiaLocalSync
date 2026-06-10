@@ -34,6 +34,55 @@ private enum ActiveSyncSession {
     }
 }
 
+private enum OverallETAWorkBucket: CaseIterable {
+    case handshake
+    case localScan
+    case remoteScan
+    case planning
+    case receiveFiles
+    case sendFiles
+    case applyLocalChanges
+    case applyRemoteChanges
+    case finalize
+}
+
+private struct OverallETAWorkState {
+    var completed: Double = 0
+    var total: Double = 0
+}
+
+private struct OverallSyncETAEstimate {
+    let requestID: UUID
+    let startedAt: Date
+    var work: [OverallETAWorkBucket: OverallETAWorkState]
+
+    init(requestID: UUID, startedAt: Date = Date()) {
+        self.requestID = requestID
+        self.startedAt = startedAt
+        self.work = Dictionary(
+            uniqueKeysWithValues: OverallETAWorkBucket.allCases.map { ($0, OverallETAWorkState()) }
+        )
+    }
+
+    var overallFraction: Double? {
+        guard let planning = work[.planning], planning.total > 0, planning.completed >= planning.total else {
+            return nil
+        }
+
+        let totalUnits = work.values.reduce(0) { $0 + $1.total }
+        guard totalUnits > 0 else {
+            return nil
+        }
+
+        let completedUnits = work.values.reduce(0) { $0 + min($1.completed, $1.total) }
+        let fraction = min(max(completedUnits / totalUnits, 0), 0.995)
+        guard fraction >= 0.02 else {
+            return nil
+        }
+        return fraction
+    }
+}
+
 enum SyncControllerError: LocalizedError {
     case transportUnavailable
     case noConnectedPeer
@@ -89,6 +138,7 @@ final class SyncTwinController: NSObject, ObservableObject {
     private var autoSyncTask: Task<Void, Never>?
     private var progressResetTask: Task<Void, Never>?
     private var progressStartedAt: Date?
+    private var overallETAEstimate: OverallSyncETAEstimate?
     private var activeSession: ActiveSyncSession? {
         didSet {
             isSyncInProgress = activeSession != nil
@@ -304,6 +354,7 @@ final class SyncTwinController: NSObject, ObservableObject {
     private func performSync(using context: SyncExecutionContext) async {
         statusText = "\(context.trigger.rawValue)中..."
         addLog("开始\(context.trigger.rawValue)，目标：\(context.peerName)。")
+        startOverallETAEstimate(requestID: context.requestID)
         updateSyncProgress(
             0.05,
             phase: "正在申请同步会话",
@@ -329,6 +380,7 @@ final class SyncTwinController: NSObject, ObservableObject {
                 trigger: context.trigger,
                 peerDeviceID: context.peerHello.deviceID
             )
+            markETAWorkComplete(.handshake, total: 1, requestID: context.requestID)
             updateSyncProgress(
                 0.14,
                 phase: "正在扫描本机目录",
@@ -336,10 +388,32 @@ final class SyncTwinController: NSObject, ObservableObject {
             )
 
             let baseline = storage.loadBaseline(for: context.peerHello.deviceID, rootPath: context.root.path)
+            let estimatedLocalScanUnits = estimatedScanWorkUnitCount(
+                root: context.root,
+                peerDeviceID: context.peerHello.deviceID,
+                baseline: baseline
+            )
+            setETAWork(
+                .localScan,
+                completed: 0,
+                total: Double(estimatedLocalScanUnits),
+                requestID: context.requestID
+            )
+            setETAWork(
+                .remoteScan,
+                completed: 0,
+                total: Double(max(estimatedLocalScanUnits, baseline.count, 1)),
+                requestID: context.requestID
+            )
             let localScanResult = try await scanLocalState(
                 root: context.root,
                 baseline: baseline,
                 peerDeviceID: context.peerHello.deviceID
+            )
+            markETAWorkComplete(
+                .localScan,
+                total: Double(max(estimatedLocalScanUnits, localScanResult.manifest.files.count, 1)),
+                requestID: context.requestID
             )
             pendingLocalManifests[context.requestID] = localScanResult.manifest.files
             let baselineDigest = SyncStateDigest.digest(for: baseline)
@@ -361,6 +435,18 @@ final class SyncTwinController: NSObject, ObservableObject {
                 throw SyncControllerError.baselineMismatch
             }
 
+            markETAWorkComplete(
+                .remoteScan,
+                total: Double(
+                    estimatedCurrentFileCount(
+                        baseline: baseline,
+                        delta: manifestMessage.delta,
+                        fallback: localScanResult.manifest.files.count
+                    )
+                ),
+                requestID: context.requestID
+            )
+
             updateSyncProgress(
                 0.36,
                 phase: "正在生成同步计划",
@@ -374,6 +460,36 @@ final class SyncTwinController: NSObject, ObservableObject {
             )
 
             let requestedRemoteFiles = uniqueRequestedFiles(from: plan)
+            let localOperations = plan.operations.filter { $0.target == .initiator }
+            let remoteOperations = plan.operations.filter { $0.target == .responder }
+            let remoteFilesToServeCount = requestedFiles(
+                for: remoteOperations.filter { $0.source == .initiator }
+            ).count
+            setETAWork(
+                .receiveFiles,
+                completed: 0,
+                total: Double(requestedRemoteFiles.count),
+                requestID: context.requestID
+            )
+            setETAWork(
+                .sendFiles,
+                completed: 0,
+                total: Double(remoteFilesToServeCount),
+                requestID: context.requestID
+            )
+            setETAWork(
+                .applyLocalChanges,
+                completed: 0,
+                total: Double(localOperations.count),
+                requestID: context.requestID
+            )
+            setETAWork(
+                .applyRemoteChanges,
+                completed: 0,
+                total: Double(remoteOperations.count),
+                requestID: context.requestID
+            )
+            markETAWorkComplete(.planning, total: 1, requestID: context.requestID)
             updateSyncProgress(
                 0.48,
                 phase: "正在接收对端文件",
@@ -387,7 +503,8 @@ final class SyncTwinController: NSObject, ObservableObject {
                 peerName: context.peerName,
                 transport: context.transport,
                 progressRange: 0.48...0.62,
-                phase: "正在接收对端文件"
+                phase: "正在接收对端文件",
+                etaWorkBucket: .receiveFiles
             ) { completed, total, batchIndex, totalBatches in
                 guard total > 0 else {
                     return "本次没有需要接收的文件。"
@@ -396,8 +513,6 @@ final class SyncTwinController: NSObject, ObservableObject {
             }
             let remoteFilesByPath = Dictionary(uniqueKeysWithValues: remoteBundleMessage.files.map { ($0.path, $0) })
 
-            let localOperations = plan.operations.filter { $0.target == .initiator }
-            let remoteOperations = plan.operations.filter { $0.target == .responder }
             updateSyncProgress(
                 0.62,
                 phase: "正在准备应用变更",
@@ -417,12 +532,14 @@ final class SyncTwinController: NSObject, ObservableObject {
             }
 
             let localFailures = try await applyOperationsInBatches(
+                requestID: context.requestID,
                 localOperations,
                 on: context.root,
                 localRole: .initiator,
                 remoteFilesByPath: remoteFilesByPath,
                 progressRange: 0.68...0.82,
-                phase: "正在更新本机文件"
+                phase: "正在更新本机文件",
+                etaWorkBucket: .applyLocalChanges
             ) { completed, total, batchIndex, totalBatches in
                 guard total > 0 else {
                     return "本机没有需要写入的变更，正在等待对端处理。"
@@ -454,6 +571,11 @@ final class SyncTwinController: NSObject, ObservableObject {
                     : "\(context.peerName) 正在应用 \(remoteOperations.count) 项变更。"
             )
             let remoteApplyResult = try await remoteApplyTask.value
+            markETAWorkComplete(
+                .applyRemoteChanges,
+                total: Double(remoteOperations.count),
+                requestID: context.requestID
+            )
 
             let failurePaths = Set(
                 remoteBundleMessage.failures.map(\.path)
@@ -469,6 +591,7 @@ final class SyncTwinController: NSObject, ObservableObject {
                 phase: "正在提交同步结果",
                 detail: "正在把最新同步基线写回两台电脑。"
             )
+            setETAWork(.finalize, completed: 0.5, total: 1, requestID: context.requestID)
             try storage.saveBaseline(updatedBaseline, for: context.peerHello.deviceID, rootPath: context.root.path)
             try context.transport.sendPayload(
                 CommitBaselineMessage(requestID: context.requestID, changes: commitChanges),
@@ -485,6 +608,7 @@ final class SyncTwinController: NSObject, ObservableObject {
             } else {
                 statusText = "同步完成，没有发生内容丢失。"
             }
+            markETAWorkComplete(.finalize, total: 1, requestID: context.requestID)
             completeSyncProgress(phase: "同步完成", detail: statusText)
             addLog(statusText)
             if let finalManifest = pendingLocalManifests[context.requestID] {
@@ -893,6 +1017,7 @@ final class SyncTwinController: NSObject, ObservableObject {
         transport: PeerTransport,
         progressRange: ClosedRange<Double>,
         phase: String,
+        etaWorkBucket: OverallETAWorkBucket? = nil,
         detailBuilder: (_ completed: Int, _ total: Int, _ batchIndex: Int, _ totalBatches: Int) -> String
     ) async throws -> FileBundleMessage {
         guard !files.isEmpty else {
@@ -905,6 +1030,14 @@ final class SyncTwinController: NSObject, ObservableObject {
         var completedCount = 0
 
         for (index, batch) in batches.enumerated() {
+            if let etaWorkBucket {
+                setETAWork(
+                    etaWorkBucket,
+                    completed: Double(completedCount),
+                    total: Double(files.count),
+                    requestID: requestID
+                )
+            }
             updateSyncProgress(
                 progressFraction(in: progressRange, completed: completedCount, total: files.count),
                 phase: phase,
@@ -926,6 +1059,14 @@ final class SyncTwinController: NSObject, ObservableObject {
             aggregatedFailures.append(contentsOf: response.failures)
             completedCount += batch.count
 
+            if let etaWorkBucket {
+                setETAWork(
+                    etaWorkBucket,
+                    completed: Double(completedCount),
+                    total: Double(files.count),
+                    requestID: requestID
+                )
+            }
             updateSyncProgress(
                 progressFraction(in: progressRange, completed: completedCount, total: files.count),
                 phase: phase,
@@ -941,12 +1082,14 @@ final class SyncTwinController: NSObject, ObservableObject {
     }
 
     private func applyOperationsInBatches(
+        requestID: UUID,
         _ operations: [SyncOperation],
         on root: URL,
         localRole: PlanRole,
         remoteFilesByPath: [String: BundledFile],
         progressRange: ClosedRange<Double>,
         phase: String,
+        etaWorkBucket: OverallETAWorkBucket? = nil,
         detailBuilder: (_ completed: Int, _ total: Int, _ batchIndex: Int, _ totalBatches: Int) -> String
     ) async throws -> [ApplyFailure] {
         guard !operations.isEmpty else {
@@ -963,6 +1106,14 @@ final class SyncTwinController: NSObject, ObservableObject {
         var completedCount = 0
 
         for (index, batch) in batches.enumerated() {
+            if let etaWorkBucket {
+                setETAWork(
+                    etaWorkBucket,
+                    completed: Double(completedCount),
+                    total: Double(operations.count),
+                    requestID: requestID
+                )
+            }
             updateSyncProgress(
                 progressFraction(in: progressRange, completed: completedCount, total: operations.count),
                 phase: phase,
@@ -978,6 +1129,14 @@ final class SyncTwinController: NSObject, ObservableObject {
             aggregatedFailures.append(contentsOf: failures)
             completedCount += batch.count
 
+            if let etaWorkBucket {
+                setETAWork(
+                    etaWorkBucket,
+                    completed: Double(completedCount),
+                    total: Double(operations.count),
+                    requestID: requestID
+                )
+            }
             updateSyncProgress(
                 progressFraction(in: progressRange, completed: completedCount, total: operations.count),
                 phase: phase,
@@ -1367,6 +1526,94 @@ final class SyncTwinController: NSObject, ObservableObject {
         }
     }
 
+    private func estimatedScanWorkUnitCount(
+        root: URL,
+        peerDeviceID: String,
+        baseline: [String: FileFingerprint]
+    ) -> Int {
+        let cachedFiles = storage.loadLocalFingerprintCache(for: peerDeviceID, rootPath: root.path)
+        return max(1, cachedFiles.count, baseline.count)
+    }
+
+    private func estimatedCurrentFileCount(
+        baseline: [String: FileFingerprint],
+        delta: DirectoryDeltaManifest,
+        fallback: Int
+    ) -> Int {
+        var estimatedCount = baseline.count
+
+        for path in delta.deletedPaths where baseline[path] != nil {
+            estimatedCount -= 1
+        }
+
+        for path in delta.changedFiles.keys where baseline[path] == nil {
+            estimatedCount += 1
+        }
+
+        return max(1, estimatedCount, fallback)
+    }
+
+    private func startOverallETAEstimate(requestID: UUID) {
+        let now = Date()
+        progressStartedAt = now
+        var estimate = OverallSyncETAEstimate(requestID: requestID, startedAt: now)
+        estimate.work[.handshake] = OverallETAWorkState(completed: 0, total: 1)
+        estimate.work[.planning] = OverallETAWorkState(completed: 0, total: 1)
+        estimate.work[.finalize] = OverallETAWorkState(completed: 0, total: 1)
+        overallETAEstimate = estimate
+    }
+
+    private func ensureOverallETAEstimate(requestID: UUID) {
+        guard overallETAEstimate?.requestID != requestID else {
+            return
+        }
+        startOverallETAEstimate(requestID: requestID)
+    }
+
+    private func setETAWork(
+        _ bucket: OverallETAWorkBucket,
+        completed: Double,
+        total: Double,
+        requestID: UUID
+    ) {
+        ensureOverallETAEstimate(requestID: requestID)
+        guard var estimate = overallETAEstimate, estimate.requestID == requestID else {
+            return
+        }
+
+        let clampedTotal = max(total, 0)
+        let clampedCompleted = min(max(completed, 0), clampedTotal)
+        estimate.work[bucket] = OverallETAWorkState(completed: clampedCompleted, total: clampedTotal)
+        overallETAEstimate = estimate
+    }
+
+    private func markETAWorkComplete(
+        _ bucket: OverallETAWorkBucket,
+        total: Double? = nil,
+        requestID: UUID
+    ) {
+        ensureOverallETAEstimate(requestID: requestID)
+        guard var estimate = overallETAEstimate, estimate.requestID == requestID else {
+            return
+        }
+
+        let currentTotal = max(total ?? estimate.work[bucket]?.total ?? 0, 0)
+        estimate.work[bucket] = OverallETAWorkState(completed: currentTotal, total: currentTotal)
+        overallETAEstimate = estimate
+    }
+
+    private func overallETAFraction(for requestID: UUID?) -> Double? {
+        guard
+            let requestID,
+            let overallETAEstimate,
+            overallETAEstimate.requestID == requestID
+        else {
+            return nil
+        }
+
+        return overallETAEstimate.overallFraction
+    }
+
     private func applyOperationsToManifest(
         _ manifest: inout [String: FileFingerprint],
         operations: [SyncOperation],
@@ -1405,12 +1652,11 @@ final class SyncTwinController: NSObject, ObservableObject {
         }
     }
 
-    private func estimatedCompletionDate(for fraction: Double, now: Date) -> Date? {
+    private func estimatedCompletionDate(for requestID: UUID?, now: Date) -> Date? {
         guard let progressStartedAt else {
             return nil
         }
-        let clamped = min(max(fraction, 0), 1)
-        guard clamped >= 0.02, clamped < 0.995 else {
+        guard let clamped = overallETAFraction(for: requestID), clamped < 0.995 else {
             return nil
         }
 
@@ -1431,14 +1677,14 @@ final class SyncTwinController: NSObject, ObservableObject {
         progressResetTask?.cancel()
         progressResetTask = nil
         let now = Date()
-        if progressStartedAt == nil || fraction + 0.1 < (syncProgress?.clampedFraction ?? 0) {
+        if progressStartedAt == nil {
             progressStartedAt = now
         }
         syncProgress = SyncProgressSnapshot(
             phase: phase,
             detail: detail,
             fractionCompleted: fraction,
-            estimatedCompletionDate: estimatedCompletionDate(for: fraction, now: now)
+            estimatedCompletionDate: estimatedCompletionDate(for: activeSession?.requestID, now: now)
         )
     }
 
@@ -1466,12 +1712,16 @@ final class SyncTwinController: NSObject, ObservableObject {
         progressResetTask?.cancel()
         progressResetTask = nil
         progressStartedAt = nil
+        overallETAEstimate = nil
         syncProgress = nil
     }
 
     private func resetSessionStateIfMatches(_ requestID: UUID) {
         if activeSession?.requestID == requestID {
             clearSyncProgress()
+        }
+        if overallETAEstimate?.requestID == requestID {
+            overallETAEstimate = nil
         }
         pendingLocalManifests.removeValue(forKey: requestID)
         releaseActiveSessionIfMatches(requestID)
@@ -1734,6 +1984,8 @@ extension SyncTwinController {
 
         try? transport.sendPayload(response, kind: .syncIntentResponse, to: peerName)
         if response.accepted {
+            ensureOverallETAEstimate(requestID: message.requestID)
+            markETAWorkComplete(.handshake, total: 1, requestID: message.requestID)
             updateSyncProgress(
                 0.05,
                 phase: "同步会话已建立",
@@ -1786,6 +2038,7 @@ extension SyncTwinController {
         }
 
         do {
+            ensureOverallETAEstimate(requestID: message.requestID)
             updateSyncProgress(
                 0.18,
                 phase: "正在扫描本机目录",
@@ -1797,10 +2050,38 @@ extension SyncTwinController {
                 throw SyncControllerError.baselineMismatch
             }
 
+            let estimatedLocalScanUnits = estimatedScanWorkUnitCount(
+                root: root,
+                peerDeviceID: remoteHello.deviceID,
+                baseline: localBaseline
+            )
+            setETAWork(
+                .localScan,
+                completed: 0,
+                total: Double(estimatedLocalScanUnits),
+                requestID: message.requestID
+            )
+            markETAWorkComplete(
+                .remoteScan,
+                total: Double(
+                    estimatedCurrentFileCount(
+                        baseline: localBaseline,
+                        delta: message.delta,
+                        fallback: estimatedLocalScanUnits
+                    )
+                ),
+                requestID: message.requestID
+            )
+
             let localScanResult = try await scanLocalState(
                 root: root,
                 baseline: localBaseline,
                 peerDeviceID: remoteHello.deviceID
+            )
+            markETAWorkComplete(
+                .localScan,
+                total: Double(max(estimatedLocalScanUnits, localScanResult.manifest.files.count, 1)),
+                requestID: message.requestID
             )
             pendingLocalManifests[message.requestID] = localScanResult.manifest.files
             try transport.sendPayload(
@@ -1850,6 +2131,12 @@ extension SyncTwinController {
 
         let progressRange = fileServiceProgressRange(for: message.requestID)
         let batchStartCount = min(message.completedFileCount, message.totalRequestedFiles)
+        setETAWork(
+            .sendFiles,
+            completed: Double(batchStartCount),
+            total: Double(message.totalRequestedFiles),
+            requestID: message.requestID
+        )
         updateSyncProgress(
             progressFraction(in: progressRange, completed: batchStartCount, total: message.totalRequestedFiles),
             phase: "正在准备同步文件",
@@ -1884,6 +2171,12 @@ extension SyncTwinController {
             message.completedFileCount + message.files.count,
             message.totalRequestedFiles
         )
+        setETAWork(
+            .sendFiles,
+            completed: Double(batchCompletedCount),
+            total: Double(message.totalRequestedFiles),
+            requestID: message.requestID
+        )
         updateSyncProgress(
             progressFraction(in: progressRange, completed: batchCompletedCount, total: message.totalRequestedFiles),
             phase: "文件已发送",
@@ -1911,11 +2204,32 @@ extension SyncTwinController {
         }
 
         let responderOperations = message.plan.operations.filter { $0.target == .responder }
+        let initiatorOperations = message.plan.operations.filter { $0.target == .initiator }
         var filesByPath = Dictionary(uniqueKeysWithValues: message.attachments.map { ($0.path, $0) })
         do {
             let filesToRequest = requestedFiles(
                 for: responderOperations.filter { $0.source == .initiator }
             ).filter { filesByPath[$0.path] == nil }
+
+            setETAWork(
+                .receiveFiles,
+                completed: 0,
+                total: Double(filesToRequest.count),
+                requestID: message.requestID
+            )
+            setETAWork(
+                .applyLocalChanges,
+                completed: 0,
+                total: Double(responderOperations.count),
+                requestID: message.requestID
+            )
+            setETAWork(
+                .applyRemoteChanges,
+                completed: 0,
+                total: Double(initiatorOperations.count),
+                requestID: message.requestID
+            )
+            markETAWorkComplete(.planning, total: 1, requestID: message.requestID)
 
             var transferFailures: [ApplyFailure] = []
             if !filesToRequest.isEmpty {
@@ -1925,7 +2239,8 @@ extension SyncTwinController {
                     peerName: peerName,
                     transport: transport,
                     progressRange: 0.52...0.72,
-                    phase: "正在接收待应用文件"
+                    phase: "正在接收待应用文件",
+                    etaWorkBucket: .receiveFiles
                 ) { completed, total, batchIndex, totalBatches in
                     "已接收 \(completed)/\(total) 个待应用文件（第 \(batchIndex)/\(totalBatches) 批）。"
                 }
@@ -1944,12 +2259,14 @@ extension SyncTwinController {
             }
 
             let applyFailures = try await applyOperationsInBatches(
+                requestID: message.requestID,
                 responderOperations,
                 on: root,
                 localRole: .responder,
                 remoteFilesByPath: filesByPath,
                 progressRange: 0.72...0.88,
-                phase: "正在应用对端变更"
+                phase: "正在应用对端变更",
+                etaWorkBucket: .applyLocalChanges
             ) { completed, total, batchIndex, totalBatches in
                 guard total > 0 else {
                     return "本机没有需要写入的变更，正在确认结果。"
@@ -2132,6 +2449,10 @@ extension SyncTwinController {
                 )
             }
             pendingLocalManifests.removeValue(forKey: message.requestID)
+            if overallETAEstimate?.requestID == message.requestID {
+                markETAWorkComplete(.applyRemoteChanges, requestID: message.requestID)
+                markETAWorkComplete(.finalize, total: 1, requestID: message.requestID)
+            }
             if shouldCompleteResponderProgress {
                 completeSyncProgress(
                     phase: "同步完成",
