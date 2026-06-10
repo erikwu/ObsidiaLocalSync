@@ -3,15 +3,12 @@ import Foundation
 
 enum DirectoryScannerError: LocalizedError {
     case noFolderConfigured
-    case fileTooLarge(String)
     case unexpectedFileMissing(String)
 
     var errorDescription: String? {
         switch self {
         case .noFolderConfigured:
             return "请先选择需要同步的目录。"
-        case let .fileTooLarge(path):
-            return "文件 \(path) 超过当前版本的单文件内联传输上限（32 MB）。"
         case let .unexpectedFileMissing(path):
             return "读取文件 \(path) 时未找到内容。"
         }
@@ -116,12 +113,6 @@ struct DirectoryScanner {
             throw DirectoryScannerError.unexpectedFileMissing(relativePath)
         }
 
-        let attributes = try fileManager.attributesOfItem(atPath: url.path)
-        let fileSize = (attributes[.size] as? NSNumber)?.intValue ?? 0
-        if fileSize > AppConstants.maxInlineFileBytes {
-            throw DirectoryScannerError.fileTooLarge(relativePath)
-        }
-
         let data = try Data(contentsOf: url)
         let actual = try fingerprint(for: url)
         guard equivalentState(actual, expectedState) else {
@@ -150,6 +141,10 @@ struct DirectoryScanner {
         if let modifiedAt {
             try? fileManager.setAttributes([.modificationDate: modifiedAt], ofItemAtPath: targetURL.path)
         }
+    }
+
+    func fingerprintForRegularFile(at url: URL) throws -> FileFingerprint {
+        try fingerprint(for: url)
     }
 
     func deleteItem(root: URL, relativePath: String) throws {

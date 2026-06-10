@@ -463,6 +463,29 @@ struct FileBundleMessage: Codable {
     let failures: [ApplyFailure]
 }
 
+struct TransferredFileDescriptor: Codable, Hashable {
+    let path: String
+    let fingerprint: FileFingerprint
+}
+
+struct FileTransferStartMessage: Codable {
+    let requestID: UUID
+    let files: [TransferredFileDescriptor]
+    let failures: [ApplyFailure]
+}
+
+struct FileTransferChunkMessage: Codable {
+    let requestID: UUID
+    let path: String
+    let chunkIndex: Int
+    let totalChunks: Int
+    let data: Data
+}
+
+struct FileTransferCompleteMessage: Codable {
+    let requestID: UUID
+}
+
 struct PlanBundleMessage: Codable {
     let requestID: UUID
     let plan: SyncPlan
@@ -485,8 +508,6 @@ struct ResolutionBundleMessage: Codable {
     let conflict: SyncConflict
     let winningSide: PlanRole
     let backupPath: String?
-    let winnerAttachment: BundledFile?
-    let loserAttachment: BundledFile?
 }
 
 struct SyncErrorMessage: Codable {
@@ -502,6 +523,9 @@ enum TransportMessageKind: String, Codable {
     case syncManifest
     case fileRequest
     case fileBundle
+    case fileTransferStart
+    case fileTransferChunk
+    case fileTransferComplete
     case planBundle
     case applyResult
     case commitBaseline

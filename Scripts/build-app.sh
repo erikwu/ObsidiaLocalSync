@@ -6,6 +6,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="SyncTwin"
 APP_VERSION="1.0.6"
 BUILD_MODE="${1:-release}"
+ICON_SOURCE="$ROOT_DIR/Resources/$APP_NAME.icns"
 
 cd "$ROOT_DIR"
 
@@ -16,11 +17,18 @@ BIN_PATH="$BIN_DIR/$APP_NAME"
 APP_DIR="$ROOT_DIR/dist/$APP_NAME.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
+RESOURCES_DIR="$CONTENTS_DIR/Resources"
+ICON_FILE="$RESOURCES_DIR/$APP_NAME.icns"
 
 mkdir -p "$MACOS_DIR"
+mkdir -p "$RESOURCES_DIR"
 
 cp "$BIN_PATH" "$MACOS_DIR/$APP_NAME"
 chmod +x "$MACOS_DIR/$APP_NAME"
+
+if [[ -f "$ICON_SOURCE" ]]; then
+    cp "$ICON_SOURCE" "$ICON_FILE"
+fi
 
 cat > "$CONTENTS_DIR/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -33,6 +41,8 @@ cat > "$CONTENTS_DIR/Info.plist" <<EOF
     <string>$APP_NAME</string>
     <key>CFBundleIdentifier</key>
     <string>local.synctwin.app</string>
+    <key>CFBundleIconFile</key>
+    <string>$APP_NAME</string>
     <key>CFBundleName</key>
     <string>$APP_NAME</string>
     <key>CFBundlePackageType</key>

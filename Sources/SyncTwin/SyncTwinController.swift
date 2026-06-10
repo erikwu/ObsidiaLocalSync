@@ -153,6 +153,7 @@ final class SyncTwinController: NSObject, ObservableObject {
     private var fileWaiters: [UUID: CheckedContinuation<FileBundleMessage, Error>] = [:]
     private var applyWaiters: [UUID: CheckedContinuation<ApplyResultMessage, Error>] = [:]
     private var pendingLocalManifests: [UUID: [String: FileFingerprint]] = [:]
+    private var incomingFileTransfers: [UUID: PendingIncomingFileTransfer] = [:]
 
     override init() {
         config = storage.loadConfiguration()
@@ -222,6 +223,21 @@ final class SyncTwinController: NSObject, ObservableObject {
         let peerHello: HelloMessage
         let root: URL
         let transport: PeerTransport
+    }
+
+    private struct IncomingTransferredFileState {
+        let descriptor: TransferredFileDescriptor
+        let temporaryURL: URL
+        var receivedBytes: Int64 = 0
+        var nextChunkIndex: Int = 0
+        var expectedTotalChunks: Int? = nil
+    }
+
+    private struct PendingIncomingFileTransfer {
+        let directoryURL: URL
+        let failures: [ApplyFailure]
+        let fileOrder: [String]
+        var filesByPath: [String: IncomingTransferredFileState]
     }
 
     func pickFolder() {
@@ -1060,27 +1076,6 @@ final class SyncTwinController: NSObject, ObservableObject {
                 conflictID: pending.conflict.id
             )
 
-            let winnerAttachment: BundledFile?
-            let loserAttachment: BundledFile?
-
-            switch winningSide {
-            case .initiator:
-                if let winnerState = pending.conflict.initiatorState, !winnerState.isDirectory {
-                    winnerAttachment = try scanner.bundleFile(root: root, relativePath: pending.conflict.path, expectedState: winnerState)
-                } else {
-                    winnerAttachment = nil
-                }
-                loserAttachment = nil
-
-            case .responder:
-                winnerAttachment = nil
-                if let loserState = pending.conflict.initiatorState, !loserState.isDirectory {
-                    loserAttachment = try scanner.bundleFile(root: root, relativePath: pending.conflict.path, expectedState: loserState)
-                } else {
-                    loserAttachment = nil
-                }
-            }
-
             updateSyncProgress(
                 0.52,
                 phase: "正在应用本机决议",
@@ -1093,9 +1088,7 @@ final class SyncTwinController: NSObject, ObservableObject {
                         requestID: requestID,
                         conflict: pending.conflict,
                         winningSide: winningSide,
-                        backupPath: backupPath,
-                        winnerAttachment: winnerAttachment,
-                        loserAttachment: loserAttachment
+                        backupPath: backupPath
                     ),
                     peerName: peerName,
                     transport: transport
@@ -1615,6 +1608,224 @@ final class SyncTwinController: NSObject, ObservableObject {
 
             return failures
         }.value
+    }
+
+    private func expectedChunkCount(for fileSize: Int64) -> Int {
+        guard fileSize > 0 else {
+            return 0
+        }
+        let chunkSize = Int64(AppConstants.fileTransferChunkBytes)
+        return Int(((fileSize - 1) / chunkSize) + 1)
+    }
+
+    private func incomingTransferDirectoryURL(for requestID: UUID) -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent(AppConstants.appName, isDirectory: true)
+            .appendingPathComponent("IncomingTransfers", isDirectory: true)
+            .appendingPathComponent(requestID.uuidString, isDirectory: true)
+    }
+
+    private func incomingTransferFileURL(for path: String, in directoryURL: URL) -> URL {
+        let pathURL = URL(fileURLWithPath: path)
+        let ext = pathURL.pathExtension
+        let filename = stableDigestString(path)
+        if ext.isEmpty {
+            return directoryURL.appendingPathComponent(filename, isDirectory: false)
+        }
+        return directoryURL
+            .appendingPathComponent(filename, isDirectory: false)
+            .appendingPathExtension(ext)
+    }
+
+    private func cleanupIncomingFileTransfer(_ requestID: UUID) {
+        guard let transfer = incomingFileTransfers.removeValue(forKey: requestID) else {
+            return
+        }
+        try? FileManager.default.removeItem(at: transfer.directoryURL)
+    }
+
+    private func failIncomingFileTransfer(_ requestID: UUID, message: String) {
+        cleanupIncomingFileTransfer(requestID)
+        let error = NSError(domain: AppConstants.appName, code: 402, userInfo: [NSLocalizedDescriptionKey: message])
+        fileWaiters.removeValue(forKey: requestID)?.resume(throwing: error)
+    }
+
+    private func handleFileTransferStart(_ message: FileTransferStartMessage) {
+        cleanupIncomingFileTransfer(message.requestID)
+
+        let directoryURL = incomingTransferDirectoryURL(for: message.requestID)
+        do {
+            try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        } catch {
+            failIncomingFileTransfer(message.requestID, message: "创建临时接收目录失败：\(error.localizedDescription)")
+            return
+        }
+
+        var filesByPath: [String: IncomingTransferredFileState] = [:]
+        for descriptor in message.files {
+            let temporaryURL = incomingTransferFileURL(for: descriptor.path, in: directoryURL)
+            if descriptor.fingerprint.size == 0 {
+                FileManager.default.createFile(atPath: temporaryURL.path, contents: Data())
+            }
+            filesByPath[descriptor.path] = IncomingTransferredFileState(
+                descriptor: descriptor,
+                temporaryURL: temporaryURL
+            )
+        }
+
+        incomingFileTransfers[message.requestID] = PendingIncomingFileTransfer(
+            directoryURL: directoryURL,
+            failures: message.failures,
+            fileOrder: message.files.map(\.path),
+            filesByPath: filesByPath
+        )
+    }
+
+    private func handleFileTransferChunk(_ message: FileTransferChunkMessage) {
+        guard var transfer = incomingFileTransfers[message.requestID] else {
+            return
+        }
+        guard var file = transfer.filesByPath[message.path] else {
+            failIncomingFileTransfer(message.requestID, message: "收到未知文件 \(message.path) 的分块数据。")
+            return
+        }
+
+        guard message.chunkIndex == file.nextChunkIndex else {
+            failIncomingFileTransfer(message.requestID, message: "文件 \(message.path) 的分块顺序异常。")
+            return
+        }
+
+        if let expectedTotalChunks = file.expectedTotalChunks, expectedTotalChunks != message.totalChunks {
+            failIncomingFileTransfer(message.requestID, message: "文件 \(message.path) 的分块数量发生变化。")
+            return
+        }
+
+        do {
+            if !FileManager.default.fileExists(atPath: file.temporaryURL.path) {
+                FileManager.default.createFile(atPath: file.temporaryURL.path, contents: nil)
+            }
+            let handle = try FileHandle(forWritingTo: file.temporaryURL)
+            defer {
+                try? handle.close()
+            }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: message.data)
+        } catch {
+            failIncomingFileTransfer(message.requestID, message: "写入文件 \(message.path) 的分块失败：\(error.localizedDescription)")
+            return
+        }
+
+        file.receivedBytes += Int64(message.data.count)
+        file.nextChunkIndex += 1
+        file.expectedTotalChunks = message.totalChunks
+        transfer.filesByPath[message.path] = file
+        incomingFileTransfers[message.requestID] = transfer
+    }
+
+    private func handleFileTransferComplete(_ message: FileTransferCompleteMessage) {
+        guard let transfer = incomingFileTransfers[message.requestID] else {
+            let fallback = FileBundleMessage(requestID: message.requestID, files: [], failures: [])
+            fileWaiters.removeValue(forKey: message.requestID)?.resume(returning: fallback)
+            return
+        }
+
+        defer {
+            cleanupIncomingFileTransfer(message.requestID)
+        }
+
+        do {
+            var files: [BundledFile] = []
+
+            for path in transfer.fileOrder {
+                guard let file = transfer.filesByPath[path] else {
+                    throw NSError(
+                        domain: AppConstants.appName,
+                        code: 403,
+                        userInfo: [NSLocalizedDescriptionKey: "缺少文件 \(path) 的接收状态。"]
+                    )
+                }
+
+                let expectedState = file.descriptor.fingerprint
+                let expectedChunks = expectedChunkCount(for: expectedState.size)
+                if file.receivedBytes != expectedState.size {
+                    throw NSError(
+                        domain: AppConstants.appName,
+                        code: 404,
+                        userInfo: [NSLocalizedDescriptionKey: "文件 \(path) 接收不完整，期望 \(expectedState.size) 字节，实际 \(file.receivedBytes) 字节。"]
+                    )
+                }
+                if file.nextChunkIndex != expectedChunks || (file.expectedTotalChunks ?? expectedChunks) != expectedChunks {
+                    throw NSError(
+                        domain: AppConstants.appName,
+                        code: 405,
+                        userInfo: [NSLocalizedDescriptionKey: "文件 \(path) 的分块数量校验失败。"]
+                    )
+                }
+
+                let data = expectedState.size == 0 ? Data() : try Data(contentsOf: file.temporaryURL)
+                if expectedState.size > 0 {
+                    let actualState = try scanner.fingerprintForRegularFile(at: file.temporaryURL)
+                    guard equivalentState(actualState, expectedState) else {
+                        throw NSError(
+                            domain: AppConstants.appName,
+                            code: 406,
+                            userInfo: [NSLocalizedDescriptionKey: "文件 \(path) 在接收后校验失败。"]
+                        )
+                    }
+                }
+
+                files.append(BundledFile(path: path, fingerprint: expectedState, data: data))
+            }
+
+            let bundle = FileBundleMessage(
+                requestID: message.requestID,
+                files: files,
+                failures: transfer.failures
+            )
+            fileWaiters.removeValue(forKey: message.requestID)?.resume(returning: bundle)
+        } catch {
+            let nsError = error as NSError
+            fileWaiters.removeValue(forKey: message.requestID)?.resume(throwing: nsError)
+        }
+    }
+
+    private func sendFileInChunks(
+        descriptor: TransferredFileDescriptor,
+        from root: URL,
+        requestID: UUID,
+        peerName: String,
+        transport: PeerTransport
+    ) throws {
+        let fileURL = scanner.absoluteURL(root: root, relativePath: descriptor.path)
+        let totalChunks = expectedChunkCount(for: descriptor.fingerprint.size)
+        guard totalChunks > 0 else {
+            return
+        }
+
+        let handle = try FileHandle(forReadingFrom: fileURL)
+        defer {
+            try? handle.close()
+        }
+
+        var chunkIndex = 0
+        while true {
+            guard let chunk = try handle.read(upToCount: AppConstants.fileTransferChunkBytes), !chunk.isEmpty else {
+                break
+            }
+
+            try transport.sendPayload(
+                FileTransferChunkMessage(
+                    requestID: requestID,
+                    path: descriptor.path,
+                    chunkIndex: chunkIndex,
+                    totalChunks: totalChunks,
+                    data: chunk
+                ),
+                kind: .fileTransferChunk,
+                to: peerName
+            )
+            chunkIndex += 1
+        }
     }
 
     private func requestSyncPermission(
@@ -2160,6 +2371,7 @@ final class SyncTwinController: NSObject, ObservableObject {
             overallETAEstimate = nil
         }
         pendingLocalManifests.removeValue(forKey: requestID)
+        cleanupIncomingFileTransfer(requestID)
         releaseActiveSessionIfMatches(requestID)
     }
 
@@ -2217,6 +2429,10 @@ final class SyncTwinController: NSObject, ObservableObject {
         fileWaiters.removeAll()
         applyWaiters.removeAll()
         pendingLocalManifests.removeAll()
+        let transferIDs = Array(incomingFileTransfers.keys)
+        for requestID in transferIDs {
+            cleanupIncomingFileTransfer(requestID)
+        }
         activeSession = nil
     }
 }
@@ -2298,6 +2514,18 @@ extension SyncTwinController: PeerTransportDelegate {
             case .fileBundle:
                 let message = try SyncMessageCodec.decodePayload(FileBundleMessage.self, from: envelope)
                 fileWaiters.removeValue(forKey: message.requestID)?.resume(returning: message)
+
+            case .fileTransferStart:
+                let message = try SyncMessageCodec.decodePayload(FileTransferStartMessage.self, from: envelope)
+                handleFileTransferStart(message)
+
+            case .fileTransferChunk:
+                let message = try SyncMessageCodec.decodePayload(FileTransferChunkMessage.self, from: envelope)
+                handleFileTransferChunk(message)
+
+            case .fileTransferComplete:
+                let message = try SyncMessageCodec.decodePayload(FileTransferCompleteMessage.self, from: envelope)
+                handleFileTransferComplete(message)
 
             case .planBundle:
                 let message = try SyncMessageCodec.decodePayload(PlanBundleMessage.self, from: envelope)
@@ -2560,11 +2788,11 @@ extension SyncTwinController {
         guard let transport, let root = watchedFolderURL else {
             return
         }
-        guard hasActiveSyncSession(requestID: message.requestID) else {
+        if let versionGateMessage {
             try? transport.sendPayload(
                 SyncErrorMessage(
                     requestID: message.requestID,
-                    message: "未建立有效的同步会话，已拒绝此次文件请求。"
+                    message: versionGateMessage
                 ),
                 kind: .syncError,
                 to: peerName
@@ -2587,29 +2815,58 @@ extension SyncTwinController {
                 ? "已整理 \(batchStartCount)/\(message.totalRequestedFiles) 个文件，正在处理第 \(message.batchIndex)/\(message.totalBatches) 批并发送给 \(peerName)。"
                 : "正在整理文件发送给 \(peerName)。"
         )
-        let scanner = DirectoryScanner()
-        let response = await Task.detached(priority: .utility) {
-            var files: [BundledFile] = []
-            var failures: [ApplyFailure] = []
+        var filesToSend: [TransferredFileDescriptor] = []
+        var failures: [ApplyFailure] = []
 
-            for request in message.files {
-                do {
-                    let current = try scanner.currentState(root: root, relativePath: request.path)
-                    guard equivalentState(current, request.expectedState) else {
-                        failures.append(ApplyFailure(path: request.path, message: "文件在发送前已变化。"))
-                        continue
-                    }
-                    let file = try scanner.bundleFile(root: root, relativePath: request.path, expectedState: request.expectedState)
-                    files.append(file)
-                } catch {
-                    failures.append(ApplyFailure(path: request.path, message: error.localizedDescription))
+        for request in message.files {
+            do {
+                let current = try scanner.currentState(root: root, relativePath: request.path)
+                guard equivalentState(current, request.expectedState) else {
+                    failures.append(ApplyFailure(path: request.path, message: "文件在发送前已变化。"))
+                    continue
                 }
+                filesToSend.append(
+                    TransferredFileDescriptor(path: request.path, fingerprint: request.expectedState)
+                )
+            } catch {
+                failures.append(ApplyFailure(path: request.path, message: error.localizedDescription))
+            }
+        }
+
+        do {
+            try transport.sendPayload(
+                FileTransferStartMessage(
+                    requestID: message.requestID,
+                    files: filesToSend,
+                    failures: failures
+                ),
+                kind: .fileTransferStart,
+                to: peerName
+            )
+
+            for descriptor in filesToSend {
+                try sendFileInChunks(
+                    descriptor: descriptor,
+                    from: root,
+                    requestID: message.requestID,
+                    peerName: peerName,
+                    transport: transport
+                )
             }
 
-            return FileBundleMessage(requestID: message.requestID, files: files, failures: failures)
-        }.value
-
-        try? transport.sendPayload(response, kind: .fileBundle, to: peerName)
+            try transport.sendPayload(
+                FileTransferCompleteMessage(requestID: message.requestID),
+                kind: .fileTransferComplete,
+                to: peerName
+            )
+        } catch {
+            try? transport.sendPayload(
+                SyncErrorMessage(requestID: message.requestID, message: error.localizedDescription),
+                kind: .syncError,
+                to: peerName
+            )
+            return
+        }
         let batchCompletedCount = min(
             message.completedFileCount + message.files.count,
             message.totalRequestedFiles
@@ -2786,7 +3043,37 @@ extension SyncTwinController {
         }
 
         let scanner = DirectoryScanner()
-        let failures = await Task.detached(priority: .userInitiated) {
+        var transferFailures: [ApplyFailure] = []
+        var initiatorFilesByPath: [String: BundledFile] = [:]
+
+        if let initiatorState = message.conflict.initiatorState,
+           !initiatorState.isDirectory,
+           message.winningSide == .initiator || message.backupPath != nil {
+            updateSyncProgress(
+                0.32,
+                phase: "正在接收冲突文件",
+                detail: "正在从 \(peerName) 拉取冲突处理所需的文件内容。"
+            )
+
+            do {
+                let bundle = try await requestFilesInBatches(
+                    requestID: message.requestID,
+                    files: [RequestedFile(path: message.conflict.path, expectedState: initiatorState)],
+                    peerName: peerName,
+                    transport: transport,
+                    progressRange: 0.32...0.54,
+                    phase: "正在接收冲突文件"
+                ) { completed, total, _, _ in
+                    "已接收 \(completed)/\(total) 个冲突文件。"
+                }
+                transferFailures = bundle.failures
+                initiatorFilesByPath = Dictionary(uniqueKeysWithValues: bundle.files.map { ($0.path, $0) })
+            } catch {
+                transferFailures = [ApplyFailure(path: message.conflict.path, message: error.localizedDescription)]
+            }
+        }
+
+        let applyFailures = await Task.detached(priority: .userInitiated) {
             var failures: [ApplyFailure] = []
 
             do {
@@ -2815,13 +3102,18 @@ extension SyncTwinController {
                         } catch {
                             failures.append(ApplyFailure(path: message.conflict.path, message: error.localizedDescription))
                         }
-                    } else if let winnerAttachment = message.winnerAttachment {
+                    } else if let winnerState = message.conflict.initiatorState {
                         do {
+                            guard let winnerFile = initiatorFilesByPath[message.conflict.path],
+                                  equivalentState(winnerFile.fingerprint, winnerState) else {
+                                failures.append(ApplyFailure(path: message.conflict.path, message: "未收到发起端的最新文件内容。"))
+                                return failures
+                            }
                             try scanner.writeData(
-                                winnerAttachment.data,
+                                winnerFile.data,
                                 to: root,
                                 relativePath: message.conflict.path,
-                                modifiedAt: winnerAttachment.fingerprint.modifiedAt
+                                modifiedAt: winnerFile.fingerprint.modifiedAt
                             )
                         } catch {
                             failures.append(ApplyFailure(path: message.conflict.path, message: error.localizedDescription))
@@ -2840,13 +3132,18 @@ extension SyncTwinController {
                         } catch {
                             failures.append(ApplyFailure(path: backupPath, message: error.localizedDescription))
                         }
-                    } else if let backupPath = message.backupPath, let loserAttachment = message.loserAttachment {
+                    } else if let backupPath = message.backupPath, let initiatorState = message.conflict.initiatorState {
                         do {
+                            guard let loserFile = initiatorFilesByPath[message.conflict.path],
+                                  equivalentState(loserFile.fingerprint, initiatorState) else {
+                                failures.append(ApplyFailure(path: backupPath, message: "未收到需要备份的对端文件。"))
+                                return failures
+                            }
                             try scanner.writeData(
-                                loserAttachment.data,
+                                loserFile.data,
                                 to: root,
                                 relativePath: backupPath,
-                                modifiedAt: loserAttachment.fingerprint.modifiedAt
+                                modifiedAt: loserFile.fingerprint.modifiedAt
                             )
                         } catch {
                             failures.append(ApplyFailure(path: backupPath, message: error.localizedDescription))
@@ -2867,6 +3164,7 @@ extension SyncTwinController {
                 return [ApplyFailure(path: message.conflict.path, message: error.localizedDescription)]
             }
         }.value
+        let failures = transferFailures + applyFailures
 
         updateSyncProgress(
             0.88,
@@ -2949,6 +3247,7 @@ extension SyncTwinController {
                 return
             }
             if let waiter = fileWaiters.removeValue(forKey: requestID) {
+                cleanupIncomingFileTransfer(requestID)
                 waiter.resume(throwing: error)
                 clearSyncProgress()
                 releaseActiveSessionIfMatches(requestID)
@@ -2960,6 +3259,7 @@ extension SyncTwinController {
                 releaseActiveSessionIfMatches(requestID)
                 return
             }
+            cleanupIncomingFileTransfer(requestID)
             clearSyncProgress()
             releaseActiveSessionIfMatches(requestID)
         }

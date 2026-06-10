@@ -65,5 +65,5 @@ The packaged app will be generated at `dist/SyncTwin.app`.
 ## Current Boundaries
 
 - The current implementation mainly targets small- to medium-sized directories such as documents, code, and configuration files.
-- Single-file transfer currently uses inline data messages with a default limit of 32 MB; files beyond that limit are blocked from syncing and require manual handling.
+- Large files are now transferred in chunks, so they are no longer capped by the previous 32 MB per-file limit; both apps should still remain running until the transfer completes.
 - The test directory already includes reserved sync-planning test cases; more tests can be added and run when the local toolchain is fully available.

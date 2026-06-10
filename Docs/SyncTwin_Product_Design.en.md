@@ -91,7 +91,7 @@ The current version does not cover the following:
 1. No cloud relay or public internet traversal.
 2. No background agent or daemon; both apps need to remain running.
 3. No simultaneous sync with multiple peers; the current design assumes one peer and one active session.
-4. No support for oversized single-file transfer; the inline single-file transfer limit is `32 MB`.
+4. Large files now use chunked transfer, but both apps still need to remain running during the transfer.
 5. Symbolic links are not treated as sync objects; symlinks are skipped by the current implementation.
 6. No custom account system, permission system, or organization-level multi-device management.
 
@@ -495,7 +495,7 @@ Based on the current implementation, the following statements are true:
 
 1. The sync channel is a local encrypted nearby transport, but there is currently no additional human-confirmed device identity verification flow.
 2. Only one active peer connection is supported; this is not a multi-device mesh sync product.
-3. Files larger than `32 MB` are rejected by the current version.
+3. Large files are now supported through chunked transfer, but weak connectivity or device sleep may still require a retry.
 4. Only regular files and directories are synced; symbolic links are not currently supported.
 5. Conflict preview is mainly aimed at file content; directory conflicts do not have a rich diff preview yet.
 6. Both devices' apps must remain running; there is currently no login-time background resident service.
@@ -505,11 +505,10 @@ Based on the current implementation, the following statements are true:
 
 If the product keeps moving toward a more polished release, the following priorities are recommended:
 
-1. Support chunked transfer for large files and remove the `32 MB` limit
-2. Add explicit device pairing confirmation to improve nearby identity trust
-3. Add a background resident agent to reduce the requirement that both apps stay in the foreground
-4. Add a more intuitive conflict diff view
-5. Expand from single-peer sync to a multi-device sync topology
+1. Add explicit device pairing confirmation to improve nearby identity trust
+2. Add a background resident agent to reduce the requirement that both apps stay in the foreground
+3. Add a more intuitive conflict diff view
+4. Expand from single-peer sync to a multi-device sync topology
 6. Add clearer historical session records and a retry center for failures
 
 ## 17. Summary
