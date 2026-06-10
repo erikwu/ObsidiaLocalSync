@@ -7,6 +7,9 @@ struct ContentView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 header
+                if let progress = controller.syncProgress {
+                    progressPanel(progress)
+                }
                 settingsCard
                 peersCard
                 conflictsCard
@@ -90,6 +93,8 @@ struct ContentView: View {
                 }
 
                 Toggle("按固定间隔自动同步", isOn: $controller.config.autoSyncEnabled)
+                Toggle("自动同步完成时播放提示音", isOn: $controller.config.autoSyncCompletionSoundEnabled)
+                    .disabled(!controller.config.autoSyncEnabled)
 
                 HStack(spacing: 12) {
                     Button("保存设置") {
@@ -105,6 +110,32 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    private func progressPanel(_ progress: SyncProgressSnapshot) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(progress.phase)
+                    .font(.headline)
+                Spacer()
+                Text(progress.percentText)
+                    .font(.subheadline.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            ProgressView(value: progress.clampedFraction)
+                .progressViewStyle(.linear)
+
+            if !progress.detail.isEmpty {
+                Text(progress.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(16)
+        .background(Color.accentColor.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     private var peersCard: some View {

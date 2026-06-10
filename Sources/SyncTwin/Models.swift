@@ -6,7 +6,53 @@ struct AppConfiguration: Codable {
     var deviceName: String
     var watchedFolderPath: String
     var autoSyncEnabled: Bool
+    var autoSyncCompletionSoundEnabled: Bool
     var syncIntervalSeconds: Int
+
+    enum CodingKeys: String, CodingKey {
+        case deviceID
+        case deviceName
+        case watchedFolderPath
+        case autoSyncEnabled
+        case autoSyncCompletionSoundEnabled
+        case syncIntervalSeconds
+    }
+
+    init(
+        deviceID: String,
+        deviceName: String,
+        watchedFolderPath: String,
+        autoSyncEnabled: Bool,
+        autoSyncCompletionSoundEnabled: Bool,
+        syncIntervalSeconds: Int
+    ) {
+        self.deviceID = deviceID
+        self.deviceName = deviceName
+        self.watchedFolderPath = watchedFolderPath
+        self.autoSyncEnabled = autoSyncEnabled
+        self.autoSyncCompletionSoundEnabled = autoSyncCompletionSoundEnabled
+        self.syncIntervalSeconds = syncIntervalSeconds
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        deviceID = try container.decode(String.self, forKey: .deviceID)
+        deviceName = try container.decode(String.self, forKey: .deviceName)
+        watchedFolderPath = try container.decode(String.self, forKey: .watchedFolderPath)
+        autoSyncEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoSyncEnabled) ?? true
+        autoSyncCompletionSoundEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoSyncCompletionSoundEnabled) ?? false
+        syncIntervalSeconds = try container.decodeIfPresent(Int.self, forKey: .syncIntervalSeconds) ?? AppConstants.defaultSyncIntervalSeconds
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(deviceID, forKey: .deviceID)
+        try container.encode(deviceName, forKey: .deviceName)
+        try container.encode(watchedFolderPath, forKey: .watchedFolderPath)
+        try container.encode(autoSyncEnabled, forKey: .autoSyncEnabled)
+        try container.encode(autoSyncCompletionSoundEnabled, forKey: .autoSyncCompletionSoundEnabled)
+        try container.encode(syncIntervalSeconds, forKey: .syncIntervalSeconds)
+    }
 
     static func makeDefault() -> AppConfiguration {
         AppConfiguration(
@@ -14,6 +60,7 @@ struct AppConfiguration: Codable {
             deviceName: Host.current().localizedName ?? "Mac",
             watchedFolderPath: "",
             autoSyncEnabled: true,
+            autoSyncCompletionSoundEnabled: false,
             syncIntervalSeconds: AppConstants.defaultSyncIntervalSeconds
         )
     }
@@ -42,6 +89,20 @@ struct ActivityItem: Identifiable, Equatable {
     let id = UUID()
     let timestamp: Date
     let text: String
+}
+
+struct SyncProgressSnapshot: Equatable {
+    let phase: String
+    let detail: String
+    let fractionCompleted: Double
+
+    var clampedFraction: Double {
+        min(max(fractionCompleted, 0), 1)
+    }
+
+    var percentText: String {
+        "\(Int((clampedFraction * 100).rounded()))%"
+    }
 }
 
 struct FileFingerprint: Codable, Hashable {
