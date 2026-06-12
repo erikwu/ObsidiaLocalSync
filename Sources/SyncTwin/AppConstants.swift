@@ -2,7 +2,7 @@ import Foundation
 
 enum AppConstants {
     static let appName = "SyncTwin"
-    static let appVersion = "1.0.10"
+    static let appVersion = "1.0.11"
     static let protocolVersion = 3
     static let serviceType = "synctwinlan"
     static let defaultSyncIntervalSeconds = 300

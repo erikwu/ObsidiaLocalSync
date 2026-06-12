@@ -14,6 +14,7 @@
 - Auto-sync is initiated by only one side: a stable device ID is used to pick the leader and avoid both timers initiating at once.
 - When the sync directory is changed or reselected, the app clears that directory's historical baseline, cache, and sync cursor so that old sync history is not reused for the current directory.
 - The sync pipeline ignores `.DS_Store` completely: no scan comparison, change tracking, transfer, or conflict handling is performed for it.
+- If one side suddenly becomes empty relative to the shared baseline, or becomes abnormally close to empty in a large-directory session, SyncTwin treats it as a suspected accidental wipe and restores surviving files from the other side instead of propagating those deletions back.
 - Changes are detected using a "shared baseline + content hash" model:
   - Changed on only one side: auto-sync to the other side.
   - Changed on both sides but with identical content: update the baseline automatically without bothering the user.

@@ -1,9 +1,9 @@
 # SyncTwin Product Design Document (Current Version)
 
 - Scope: product requirements and flow design based on the current repository implementation
-- App version: `1.0.10`
-- Protocol version: `2`
-- Updated on: `2026-06-10`
+- App version: `1.0.11`
+- Protocol version: `3`
+- Updated on: `2026-06-12`
 - Chinese version: [SyncTwin_Product_Design.md](./SyncTwin_Product_Design.md)
 - Documentation maintenance policy: this design document and the README should be maintained together in both Chinese and English going forward.
 
@@ -52,6 +52,7 @@ The current sync data plane is local and nearby. App update checking and install
 3. When both sides changed the same path and the results differ, the path must enter conflict state.
 4. Conflict resolution must preserve the unselected version as a conflict backup so that manual decisions still do not lose content.
 5. Only paths applied successfully may be written into the new sync baseline; failed paths must not pretend to be "already synced."
+6. If one side suddenly becomes empty relative to the shared baseline, or becomes abnormally close to empty in a large-directory session, the system must protect surviving files first and must not propagate those deletions directly to the other Mac.
 
 ### 4.3 Trigger Modes
 
@@ -77,6 +78,7 @@ The current sync data plane is local and nearby. App update checking and install
 4. The UI should show an estimated remaining time close to the whole sync session, not only the current step.
 5. Manual sync should play a completion sound; automatic sync sound should be configurable.
 6. The sync pipeline must completely ignore `.DS_Store`, with no comparison, sync, delete decision, or conflict handling for it.
+7. While keeping the performance benefit of incremental scanning, the system should detect likely accidental directory wipes and automatically switch to a safe restore strategy.
 
 ### 4.6 Update Capability
 
@@ -271,6 +273,7 @@ The sync plan is centered on the shared baseline and looks at how both initiator
 1. Only one side changed: generate a sync operation to update the other side automatically.
 2. Both sides changed but the results are identical: no manual judgment is needed; write the resulting state into the new baseline directly.
 3. Both sides changed and the results differ: generate a conflict item and do not overwrite automatically.
+4. If one side shows "non-empty baseline but now effectively empty" or "large-directory mass deletion with only a tiny remainder," that side is treated as a suspected accidental wipe. For deletions reported by that side, if the peer still has the path, the plan restores the surviving content instead of propagating the deletion.
 
 The plan produces three kinds of outputs:
 

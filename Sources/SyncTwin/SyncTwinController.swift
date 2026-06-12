@@ -690,6 +690,23 @@ final class SyncTwinController: NSObject, ObservableObject {
                 phase: "正在生成同步计划",
                 detail: "正在比较两台电脑的新增、修改和删除。"
             )
+            let recoveryCandidates = planner.recoveryCandidates(
+                baseline: baseline,
+                initiatorDelta: localScanResult.delta,
+                responderDelta: manifestMessage.delta
+            )
+            if let recoveryNotice = recoveryProtectionNotice(
+                recoveryCandidates: recoveryCandidates,
+                peerName: context.peerName,
+                localRole: .initiator
+            ) {
+                updateSyncProgress(
+                    0.36,
+                    phase: "正在生成同步计划",
+                    detail: recoveryNotice
+                )
+                addLog(recoveryNotice)
+            }
             let plan = planner.makePlan(
                 requestID: context.requestID,
                 baseline: baseline,
@@ -2200,6 +2217,32 @@ final class SyncTwinController: NSObject, ObservableObject {
         return max(1, estimatedCount, fallback)
     }
 
+    private func recoveryProtectionNotice(
+        recoveryCandidates: Set<PlanRole>,
+        peerName: String,
+        localRole: PlanRole
+    ) -> String? {
+        guard !recoveryCandidates.isEmpty else {
+            return nil
+        }
+
+        let remoteRole: PlanRole = localRole == .initiator ? .responder : .initiator
+
+        if recoveryCandidates.contains(localRole) && recoveryCandidates.contains(remoteRole) {
+            return "检测到两侧目录都出现异常的大规模清空迹象，已启用安全回补保护，优先保留仍然存在的文件。"
+        }
+
+        if recoveryCandidates.contains(localRole) {
+            return "检测到本机目录疑似被清空，已启用安全回补保护，会优先从 \(peerName) 回补仍然存在的文件。"
+        }
+
+        if recoveryCandidates.contains(remoteRole) {
+            return "检测到 \(peerName) 的目录疑似被清空，已启用安全回补保护，不会把对方的大量删除直接同步回本机。"
+        }
+
+        return nil
+    }
+
     private func startOverallETAEstimate(requestID: UUID) {
         let now = Date()
         progressStartedAt = now
@@ -2755,6 +2798,22 @@ extension SyncTwinController {
                 requestID: message.requestID
             )
             pendingLocalManifests[message.requestID] = localScanResult.manifest.files
+            if let recoveryNotice = recoveryProtectionNotice(
+                recoveryCandidates: planner.recoveryCandidates(
+                    baseline: localBaseline,
+                    initiatorDelta: message.delta,
+                    responderDelta: localScanResult.delta
+                ),
+                peerName: peerName,
+                localRole: .responder
+            ) {
+                updateSyncProgress(
+                    0.28,
+                    phase: "正在保护现存文件",
+                    detail: recoveryNotice
+                )
+                addLog(recoveryNotice)
+            }
             try transport.sendPayload(
                 SyncManifestMessage(
                     requestID: message.requestID,

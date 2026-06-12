@@ -114,6 +114,84 @@ final class SyncPlannerTests: XCTestCase {
         XCTAssertTrue(plan.baselineChanges.isEmpty)
     }
 
+    func testCompleteWipeRestoresInitiatorInsteadOfDeletingResponder() {
+        let baseline = baselineFiles(count: 6)
+        let deletedPaths = baseline.keys.sorted()
+
+        let plan = planner.makePlan(
+            requestID: UUID(),
+            baseline: baseline,
+            initiatorDelta: delta(deleted: deletedPaths),
+            responderDelta: delta()
+        )
+
+        XCTAssertTrue(plan.conflicts.isEmpty)
+        XCTAssertEqual(plan.operations.count, baseline.count)
+        XCTAssertTrue(plan.operations.allSatisfy { $0.target == .initiator })
+        XCTAssertTrue(plan.operations.allSatisfy { $0.source == .responder })
+        XCTAssertEqual(
+            Dictionary(uniqueKeysWithValues: plan.baselineChanges.map { ($0.path, $0.resultingState) }),
+            baseline
+        )
+    }
+
+    func testCompleteWipeRestoresResponderInsteadOfDeletingInitiator() {
+        let baseline = baselineFiles(count: 6)
+        let deletedPaths = baseline.keys.sorted()
+
+        let plan = planner.makePlan(
+            requestID: UUID(),
+            baseline: baseline,
+            initiatorDelta: delta(),
+            responderDelta: delta(deleted: deletedPaths)
+        )
+
+        XCTAssertTrue(plan.conflicts.isEmpty)
+        XCTAssertEqual(plan.operations.count, baseline.count)
+        XCTAssertTrue(plan.operations.allSatisfy { $0.target == .responder })
+        XCTAssertTrue(plan.operations.allSatisfy { $0.source == .initiator })
+        XCTAssertEqual(
+            Dictionary(uniqueKeysWithValues: plan.baselineChanges.map { ($0.path, $0.resultingState) }),
+            baseline
+        )
+    }
+
+    func testNearEmptyMassDeletionRecoversRemainingBaselineFromHealthySide() {
+        let baseline = baselineFiles(count: 100)
+        let deletedPaths = baseline.keys.sorted().dropLast(5)
+
+        let plan = planner.makePlan(
+            requestID: UUID(),
+            baseline: baseline,
+            initiatorDelta: delta(),
+            responderDelta: delta(deleted: Array(deletedPaths))
+        )
+
+        XCTAssertTrue(plan.conflicts.isEmpty)
+        XCTAssertEqual(plan.operations.count, deletedPaths.count)
+        XCTAssertTrue(plan.operations.allSatisfy { $0.target == .responder })
+        XCTAssertTrue(plan.operations.allSatisfy { $0.source == .initiator })
+    }
+
+    func testOrdinarySingleDeleteStillPropagatesDeletion() {
+        let baseline = baselineFiles(count: 2)
+        let deletedPath = "file-0.txt"
+
+        let plan = planner.makePlan(
+            requestID: UUID(),
+            baseline: baseline,
+            initiatorDelta: delta(deleted: [deletedPath]),
+            responderDelta: delta()
+        )
+
+        XCTAssertTrue(plan.conflicts.isEmpty)
+        XCTAssertEqual(plan.operations.count, 1)
+        XCTAssertEqual(plan.operations.first?.path, deletedPath)
+        XCTAssertEqual(plan.operations.first?.target, .responder)
+        XCTAssertNil(plan.operations.first?.source)
+        XCTAssertNil(plan.operations.first?.resultingState)
+    }
+
     private func fingerprint(hash: String) -> FileFingerprint {
         FileFingerprint(
             contentHash: hash,
@@ -128,6 +206,14 @@ final class SyncPlannerTests: XCTestCase {
             size: 0,
             modifiedAt: Date(timeIntervalSince1970: 1_717_171_717),
             isDirectory: true
+        )
+    }
+
+    private func baselineFiles(count: Int) -> [String: FileFingerprint] {
+        Dictionary(
+            uniqueKeysWithValues: (0..<count).map { index in
+                ("file-\(index).txt", fingerprint(hash: "baseline-\(index)"))
+            }
         )
     }
 
