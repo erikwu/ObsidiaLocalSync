@@ -246,6 +246,9 @@ struct DirectoryChangeJournal: Codable {
         noteObservedEventID(eventID)
 
         let path = normalizedRelativePath(rawPath)
+        guard !shouldIgnoreSyncRelativePath(path) else {
+            return
+        }
         let scope: DirtyPathScope = path.isEmpty ? .subtree : rawScope
 
         if let coveringAncestor = ancestorSubtreePath(for: path), coveringAncestor != path || scope == .file {
@@ -287,6 +290,9 @@ struct DirectoryChangeJournal: Codable {
                 guard record.lastEventID > eventID else {
                     return nil
                 }
+                guard !shouldIgnoreSyncRelativePath(path) else {
+                    return nil
+                }
                 return DirectoryDirtyPath(path: path, scope: record.scope, lastEventID: record.lastEventID)
             }
             .sorted { lhs, rhs in
@@ -298,6 +304,11 @@ struct DirectoryChangeJournal: Codable {
                 }
                 return lhs.scope == .subtree && rhs.scope == .file
             }
+    }
+
+    mutating func removeIgnoredSyncPaths() {
+        trackedChanges = trackedChanges.filter { !shouldIgnoreSyncRelativePath($0.key) }
+        updatedAt = Date()
     }
 
     private func ancestorSubtreePath(for path: String) -> String? {
@@ -541,6 +552,7 @@ struct Envelope: Codable {
 enum SyncStateDigest {
     static func digest(for files: [String: FileFingerprint]) -> String {
         let canonical = files
+            .filter { !shouldIgnoreSyncRelativePath($0.key) }
             .sorted { $0.key < $1.key }
             .map { path, fingerprint in
                 "\(path)\t\(fingerprint.isDirectory ? "dir" : "file")\t\(fingerprint.contentHash)\t\(fingerprint.size)"
@@ -599,6 +611,9 @@ func equivalentState(_ lhs: FileFingerprint?, _ rhs: FileFingerprint?) -> Bool {
 
 func updateBaseline(_ baseline: inout [String: FileFingerprint], with changes: [BaselineChange]) {
     for change in changes {
+        guard !shouldIgnoreSyncRelativePath(change.path) else {
+            continue
+        }
         if let state = change.resultingState {
             baseline[change.path] = state
         } else {
@@ -620,6 +635,17 @@ func canonicalDirectoryRootPath(_ raw: String) -> String {
         return ""
     }
     return URL(fileURLWithPath: trimmed, isDirectory: true).standardizedFileURL.path
+}
+
+func shouldIgnoreSyncRelativePath(_ raw: String) -> Bool {
+    let normalized = normalizedRelativePath(raw)
+    guard !normalized.isEmpty else {
+        return false
+    }
+
+    return normalized
+        .split(separator: "/")
+        .contains(where: { $0 == ".DS_Store" })
 }
 
 func stableDigestString(_ raw: String) -> String {

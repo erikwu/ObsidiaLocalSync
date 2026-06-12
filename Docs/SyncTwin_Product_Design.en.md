@@ -1,7 +1,7 @@
 # SyncTwin Product Design Document (Current Version)
 
 - Scope: product requirements and flow design based on the current repository implementation
-- App version: `1.0.9`
+- App version: `1.0.10`
 - Protocol version: `2`
 - Updated on: `2026-06-10`
 - Chinese version: [SyncTwin_Product_Design.md](./SyncTwin_Product_Design.md)
@@ -76,6 +76,7 @@ The current sync data plane is local and nearby. App update checking and install
 3. Progress text should display real processing progress as much as possible, such as received or processed file counts.
 4. The UI should show an estimated remaining time close to the whole sync session, not only the current step.
 5. Manual sync should play a completion sound; automatic sync sound should be configurable.
+6. The sync pipeline must completely ignore `.DS_Store`, with no comparison, sync, delete decision, or conflict handling for it.
 
 ### 4.6 Update Capability
 

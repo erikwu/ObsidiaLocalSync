@@ -46,12 +46,14 @@ final class AppStorage {
         guard let data = try? Data(contentsOf: url) else {
             return [:]
         }
-        return (try? SyncMessageCodec.decoder.decode([String: FileFingerprint].self, from: data)) ?? [:]
+        let baseline = (try? SyncMessageCodec.decoder.decode([String: FileFingerprint].self, from: data)) ?? [:]
+        return baseline.filter { !shouldIgnoreSyncRelativePath($0.key) }
     }
 
     func saveBaseline(_ baseline: [String: FileFingerprint], for peerDeviceID: String, rootPath: String) throws {
         try prepareDirectories()
-        let data = try SyncMessageCodec.encoder.encode(baseline)
+        let filteredBaseline = baseline.filter { !shouldIgnoreSyncRelativePath($0.key) }
+        let data = try SyncMessageCodec.encoder.encode(filteredBaseline)
         try data.write(to: baselineURL(for: peerDeviceID, rootPath: rootPath), options: .atomic)
     }
 
@@ -60,7 +62,8 @@ final class AppStorage {
         guard let data = try? Data(contentsOf: url) else {
             return [:]
         }
-        return (try? SyncMessageCodec.decoder.decode([String: FileFingerprint].self, from: data)) ?? [:]
+        let cache = (try? SyncMessageCodec.decoder.decode([String: FileFingerprint].self, from: data)) ?? [:]
+        return cache.filter { !shouldIgnoreSyncRelativePath($0.key) }
     }
 
     func saveLocalFingerprintCache(
@@ -69,7 +72,8 @@ final class AppStorage {
         rootPath: String
     ) throws {
         try prepareDirectories()
-        let data = try SyncMessageCodec.encoder.encode(fingerprints)
+        let filteredFingerprints = fingerprints.filter { !shouldIgnoreSyncRelativePath($0.key) }
+        let data = try SyncMessageCodec.encoder.encode(filteredFingerprints)
         try data.write(to: localFingerprintCacheURL(for: peerDeviceID, rootPath: rootPath), options: .atomic)
     }
 
@@ -82,12 +86,16 @@ final class AppStorage {
         guard let data = try? Data(contentsOf: url) else {
             return DirectoryChangeJournal()
         }
-        return (try? SyncMessageCodec.decoder.decode(DirectoryChangeJournal.self, from: data)) ?? DirectoryChangeJournal()
+        var journal = (try? SyncMessageCodec.decoder.decode(DirectoryChangeJournal.self, from: data)) ?? DirectoryChangeJournal()
+        journal.removeIgnoredSyncPaths()
+        return journal
     }
 
     func saveDirectoryChangeJournal(_ journal: DirectoryChangeJournal, rootPath: String) throws {
         try prepareDirectories()
-        let data = try SyncMessageCodec.encoder.encode(journal)
+        var filteredJournal = journal
+        filteredJournal.removeIgnoredSyncPaths()
+        let data = try SyncMessageCodec.encoder.encode(filteredJournal)
         try data.write(to: directoryChangeJournalURL(for: rootPath), options: .atomic)
     }
 

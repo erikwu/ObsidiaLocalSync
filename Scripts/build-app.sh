@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="SyncTwin"
-APP_VERSION="1.0.6"
+APP_VERSION="1.0.10"
 BUILD_MODE="${1:-release}"
 ICON_SOURCE="$ROOT_DIR/Resources/$APP_NAME.icns"
 

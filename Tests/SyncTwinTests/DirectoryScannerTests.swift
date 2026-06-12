@@ -3,6 +3,40 @@ import XCTest
 @testable import SyncTwin
 
 final class DirectoryScannerTests: XCTestCase {
+    func testScanIgnoresDSStoreFilesAndOldBaselineEntries() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SyncTwinTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let scanner = DirectoryScanner()
+
+        let noteURL = root.appendingPathComponent("note.txt")
+        try Data("hello".utf8).write(to: noteURL)
+
+        let dsStoreURL = root.appendingPathComponent(".DS_Store")
+        try Data("finder".utf8).write(to: dsStoreURL)
+
+        let legacyDSStore = FileFingerprint(
+            contentHash: "legacy",
+            size: 12,
+            modifiedAt: Date(timeIntervalSince1970: 1_717_171_717)
+        )
+
+        let result = try scanner.scan(
+            root: root,
+            cachedFiles: [:],
+            baseline: [".DS_Store": legacyDSStore]
+        )
+
+        XCTAssertNil(result.manifest.files[".DS_Store"])
+        XCTAssertNil(result.delta.changedFiles[".DS_Store"])
+        XCTAssertFalse(result.delta.deletedPaths.contains(".DS_Store"))
+        XCTAssertNotNil(result.manifest.files["note.txt"])
+    }
+
     func testBundleFileSupportsFilesLargerThanThirtyTwoMegabytes() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("SyncTwinTests-\(UUID().uuidString)", isDirectory: true)

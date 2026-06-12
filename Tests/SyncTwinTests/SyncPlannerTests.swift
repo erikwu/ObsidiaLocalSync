@@ -99,6 +99,21 @@ final class SyncPlannerTests: XCTestCase {
         XCTAssertEqual(plan.conflicts.first?.reason, .bothCreatedDifferently)
     }
 
+    func testPlannerIgnoresDSStoreChanges() {
+        let dsStore = fingerprint(hash: "finder")
+
+        let plan = planner.makePlan(
+            requestID: UUID(),
+            baseline: [".DS_Store": dsStore],
+            initiatorDelta: delta(changed: [".DS_Store": dsStore], deleted: [".DS_Store"]),
+            responderDelta: delta(changed: [".DS_Store": dsStore], deleted: [".DS_Store"])
+        )
+
+        XCTAssertTrue(plan.operations.isEmpty)
+        XCTAssertTrue(plan.conflicts.isEmpty)
+        XCTAssertTrue(plan.baselineChanges.isEmpty)
+    }
+
     private func fingerprint(hash: String) -> FileFingerprint {
         FileFingerprint(
             contentHash: hash,

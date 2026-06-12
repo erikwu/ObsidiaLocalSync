@@ -97,6 +97,9 @@ struct DirectoryScanner {
     }
 
     func currentState(root: URL, relativePath: String) throws -> FileFingerprint? {
+        guard !shouldIgnoreSyncRelativePath(relativePath) else {
+            return nil
+        }
         let url = absoluteURL(root: root, relativePath: relativePath)
         guard fileManager.fileExists(atPath: url.path) else {
             return nil
@@ -105,6 +108,9 @@ struct DirectoryScanner {
     }
 
     func bundleFile(root: URL, relativePath: String, expectedState: FileFingerprint) throws -> BundledFile {
+        guard !shouldIgnoreSyncRelativePath(relativePath) else {
+            throw DirectoryScannerError.unexpectedFileMissing(relativePath)
+        }
         guard !expectedState.isDirectory else {
             throw DirectoryScannerError.unexpectedFileMissing(relativePath)
         }
@@ -167,17 +173,19 @@ struct DirectoryScanner {
         filesystemWorkUnits: Int,
         dirtyPathCount: Int
     ) -> LocalScanResult {
+        let filteredFiles = files.filter { !shouldIgnoreSyncRelativePath($0.key) }
+        let filteredBaseline = baseline.filter { !shouldIgnoreSyncRelativePath($0.key) }
         var changedFiles: [String: FileFingerprint] = [:]
-        for (path, fingerprint) in files where !equivalentState(fingerprint, baseline[path]) {
+        for (path, fingerprint) in filteredFiles where !equivalentState(fingerprint, filteredBaseline[path]) {
             changedFiles[path] = fingerprint
         }
 
-        let deletedPaths = baseline.keys
-            .filter { files[$0] == nil }
+        let deletedPaths = filteredBaseline.keys
+            .filter { filteredFiles[$0] == nil }
             .sorted()
 
         return LocalScanResult(
-            manifest: DirectoryManifest(scannedAt: scannedAt, files: files),
+            manifest: DirectoryManifest(scannedAt: scannedAt, files: filteredFiles),
             delta: DirectoryDeltaManifest(
                 scannedAt: scannedAt,
                 changedFiles: changedFiles,
@@ -241,6 +249,11 @@ struct DirectoryScanner {
         root: URL,
         relativePath: String
     ) throws -> Int {
+        if shouldIgnoreSyncRelativePath(relativePath) {
+            removeEntries(in: &files, matching: relativePath)
+            return 1
+        }
+
         let cachedSnapshot = files
         let url = absoluteURL(root: root, relativePath: relativePath)
 
@@ -277,6 +290,11 @@ struct DirectoryScanner {
         root: URL,
         relativePath: String
     ) throws -> Int {
+        if shouldIgnoreSyncRelativePath(relativePath) {
+            removeEntries(in: &files, matching: relativePath)
+            return 1
+        }
+
         let cachedSnapshot = files
         let url = relativePath.isEmpty ? root : absoluteURL(root: root, relativePath: relativePath)
 
@@ -331,6 +349,9 @@ struct DirectoryScanner {
                 return (files, 1)
             }
             let directoryPath = relativePath(for: directoryURL, under: root)
+            if shouldIgnoreSyncRelativePath(directoryPath) {
+                return (files, 1)
+            }
             files[directoryPath] = directoryFingerprint(for: rootValues)
             workUnits += 1
         }
@@ -344,14 +365,19 @@ struct DirectoryScanner {
         }
 
         for case let url as URL in enumerator {
+            let relativePath = relativePath(for: url, under: root)
+            if shouldIgnoreSyncRelativePath(relativePath) {
+                enumerator.skipDescendants()
+                continue
+            }
+
             let values = try url.resourceValues(forKeys: resourceKeys)
             if values.isSymbolicLink == true {
                 continue
             }
             if values.isDirectory == true {
                 workUnits += 1
-                let directoryPath = relativePath(for: url, under: root)
-                files[directoryPath] = directoryFingerprint(for: values)
+                files[relativePath] = directoryFingerprint(for: values)
                 continue
             }
             guard values.isRegularFile == true else {
@@ -359,7 +385,6 @@ struct DirectoryScanner {
             }
 
             workUnits += 1
-            let relativePath = relativePath(for: url, under: root)
             let modifiedAt = values.contentModificationDate ?? Date.distantPast
             let size = Int64(values.fileSize ?? 0)
 

@@ -11,6 +11,7 @@ struct SyncPlanner {
             .union(initiatorDelta.deletedPaths)
             .union(responderDelta.changedFiles.keys)
             .union(responderDelta.deletedPaths)
+            .filter { !shouldIgnoreSyncRelativePath($0) }
             .sorted()
 
         var operations: [SyncOperation] = []

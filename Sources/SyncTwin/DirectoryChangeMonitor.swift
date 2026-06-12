@@ -182,6 +182,11 @@ final class DirectoryChangeMonitor {
                 continue
             }
 
+            if shouldIgnoreSyncRelativePath(relativePath) {
+                snapshot.noteObservedEventID(eventID)
+                continue
+            }
+
             let dirtyPath = dirtyPathSelection(for: relativePath, flags: flag)
             snapshot.recordChange(path: dirtyPath.path, scope: dirtyPath.scope, eventID: eventID)
         }
